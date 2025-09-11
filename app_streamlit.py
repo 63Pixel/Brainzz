@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App (gepatcht)
-- Expander-Farben per CSS (anpassbar)
-- Sessions-Vorschau entfernt (nur noch kompakte Info)
-- Rekursive Extraktion (.zip/.sip)
+EEG-Auswertung Streamlit App
+Features:
+- Datei-Upload / FTP / SFTP / Dropbox (Dropbox-Token via st.secrets oder env)
+- Rekursive Extraktion von .zip und .sip (auch verschachtelt)
+- Robustere CSV-Erkennung
 - Session-Auswahl: Alle / Letzte Tage / Letzte N Sessions
 - Hilfe-Expander standardmäßig eingeklappt
+- CSS für Expander- und Badge-Farben (einfach anpassbar)
+- Plotly-Interaktive Diagramme (Stress/Entspannung, Bänder)
+- Optionales Rohdaten-Preprocessing, wenn SciPy verfügbar
+Save as app_streamlit.py and run with `streamlit run app_streamlit.py`.
 """
 import os
 import io
@@ -36,27 +41,31 @@ try:
 except Exception:
     HAS_SCIPY = False
 
+# Dropbox SDK (optional)
+try:
+    import dropbox
+    HAS_DROPBOX = True
+except Exception:
+    HAS_DROPBOX = False
+
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 
-# --- Badge CSS ---
+# ---------------- Styling (edit hex values here) ----------------
 st.markdown("""
 <style>
+/* Badges */
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;color:#fff;font-size:12px;margin-right:8px}
 .badge-recent{background:#ff8c00}
-.badge-newest{background:#0b3d91}
+.badge-newest{background:#28a745}
 .badge-both{background:#6f42c1}
 .session-row{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
-</style>
-""", unsafe_allow_html=True)
 
-# --- Expander color CSS (edit hex values to change colors) ---
-st.markdown("""
-<style>
+/* Expander colors (change variables below) */
 :root{
-  --expander-bg: #e9ecef;
-  --expander-text: #0b3d91;
-  --expander-open-bg: #0b3d91;
-  --expander-open-text: #ffffff;
+  --expander-bg: #e9ecef;        /* background when closed */
+  --expander-text: #0b3d91;      /* text when closed */
+  --expander-open-bg: #28a745;   /* background when open */
+  --expander-open-text: #ffffff; /* text when open */
 }
 div.stExpander > div[data-testid="stExpander"] > details > summary,
 details > summary {
@@ -65,7 +74,6 @@ details > summary {
   padding: 8px 12px !important;
   border-radius: 8px !important;
   margin-bottom: 6px !important;
-  outline: none !important;
   cursor: pointer;
 }
 details[open] > summary,
@@ -73,17 +81,14 @@ div.stExpander[open] > summary {
   background: var(--expander-open-bg) !important;
   color: var(--expander-open-text) !important;
 }
-div.stExpander > div[data-testid="stExpander"] {
-  padding-top: 8px;
-  padding-bottom: 8px;
-}
 </style>
 """, unsafe_allow_html=True)
 
 st.title("EEG-Auswertung")
-st.caption("Interaktive Auswertung. ZIP/FTP/SFTP hochladen, Sessions auswählen, Analyse starten.")
+st.caption("Upload/Dropbox/FTP/SFTP → Sessions auswählen → Auswertung starten")
 
-# regex for filenames like brainzz_YYYY-MM-DD--HH-MM-SS
+# ---------------- Filename timestamp parsing ----------------
+# expected filename pattern: brainzz_YYYY-MM-DD--HH-MM-SS
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path):
@@ -95,7 +100,7 @@ def parse_dt_from_path(path):
     except Exception:
         return None
 
-# optional signal processing helpers
+# ---------------- Signal helpers (best-effort) ----------------
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
     if not HAS_SCIPY:
         return x
@@ -157,56 +162,6 @@ def load_session_relatives(csv_path):
     rel = rel.div(total, axis=0).dropna()
     return rel
 
-def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
-    rows = []
-    total = max(1, len(csv_paths))
-    if st_container is not None:
-        progress = st_container.progress(0)
-        status_text = st_container.empty()
-    for i, cp in enumerate(sorted(csv_paths), start=1):
-        dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
-        if dt is None:
-            if st_container is not None:
-                status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
-            continue
-        proc_path, did_proc = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
-        rel = load_session_relatives(proc_path)
-        if rel is None or rel.empty:
-            rel = load_session_relatives(cp)
-            if rel is None or rel.empty:
-                if st_container is not None:
-                    status_text.text(f"Skipping (no band columns): {os.path.basename(cp)}")
-                continue
-        alpha = float(rel["alpha"].mean())
-        beta  = float(rel["beta"].mean())
-        theta = float(rel["theta"].mean())
-        delta = float(rel["delta"].mean())
-        gamma = float(rel["gamma"].mean())
-        stress = float(beta/(alpha+1e-9))
-        relax  = float(alpha/(beta+1e-9))
-        rows.append({
-            "datetime": dt,
-            "alpha": alpha,
-            "beta": beta,
-            "theta": theta,
-            "delta": delta,
-            "gamma": gamma,
-            "stress": stress,
-            "relax": relax,
-            "proc": did_proc,
-            "source": os.path.basename(cp)
-        })
-        if st_container is not None:
-            progress.progress(int(i/total*100))
-            status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
-    if st_container is not None:
-        progress.empty()
-        status_text.empty()
-    df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
-    if not df.empty:
-        df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
-    return df
-
 def try_compute_faa_from_csv(csv_path):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -220,7 +175,7 @@ def try_compute_faa_from_csv(csv_path):
         return np.log(right+1e-9) - np.log(left+1e-9)
     return None
 
-# plotting helpers
+# ---------------- Plot helpers ----------------
 def plot_single_session_interactive(df):
     vals = {
         "Stress": df["stress"].iloc[0],
@@ -277,8 +232,12 @@ def plot_bands(df, smooth=5):
     fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
     return fig
 
-# recursive extraction for nested archives
+# ---------------- Recursive extraction ----------------
 def recursively_extract_archives(root_dir):
+    """
+    Extract .zip and .sip recursively. Mark extracted archives by renaming them to .extracted
+    to avoid infinite loops.
+    """
     changed = True
     while changed:
         changed = False
@@ -305,13 +264,120 @@ def recursively_extract_archives(root_dir):
             except Exception:
                 continue
 
+# ---------------- Dropbox helper ----------------
+def download_dropbox_folder(dbx_token: str, dropbox_path: str, local_dir: str):
+    """
+    Download all files and subfolders from dropbox_path into local_dir.
+    Requires dropbox SDK and a valid token. Does not store token.
+    """
+    if not HAS_DROPBOX:
+        raise RuntimeError("Dropbox SDK nicht installiert.")
+    dbx = dropbox.Dropbox(dbx_token, timeout=300)
+
+    def list_folder(path):
+        res = dbx.files_list_folder(path, recursive=False)
+        entries = res.entries[:]
+        while res.has_more:
+            res = dbx.files_list_folder_continue(res.cursor)
+            entries.extend(res.entries)
+        return entries
+
+    os.makedirs(local_dir, exist_ok=True)
+    stack = [dropbox_path]
+    while stack:
+        cur = stack.pop()
+        try:
+            entries = list_folder(cur)
+        except Exception:
+            # If cur is a file path, try download directly
+            try:
+                md, res = dbx.files_download(cur)
+                name = os.path.basename(cur)
+                local_path = os.path.join(local_dir, name)
+                with open(local_path, "wb") as f:
+                    f.write(res.content)
+                continue
+            except Exception:
+                continue
+
+        for ent in entries:
+            # File metadata
+            if isinstance(ent, dropbox.files.FileMetadata):
+                local_path = os.path.join(local_dir, os.path.basename(ent.path_display))
+                if os.path.exists(local_path):
+                    continue
+                try:
+                    md, res = dbx.files_download(ent.path_lower)
+                    with open(local_path, "wb") as f:
+                        f.write(res.content)
+                except Exception:
+                    try:
+                        dbx.files_download_to_file(local_path, ent.path_lower)
+                    except Exception:
+                        pass
+            # Folder metadata
+            elif isinstance(ent, dropbox.files.FolderMetadata):
+                stack.append(ent.path_lower)
+
+# ---------------- build session table ----------------
+def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
+    rows = []
+    total = max(1, len(csv_paths))
+    if st_container is not None:
+        progress = st_container.progress(0)
+        status_text = st_container.empty()
+    for i, cp in enumerate(sorted(csv_paths), start=1):
+        dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
+        if dt is None:
+            if st_container is not None:
+                status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
+            continue
+        proc_path, did_proc = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
+        rel = load_session_relatives(proc_path)
+        if rel is None or rel.empty:
+            rel = load_session_relatives(cp)
+            if rel is None or rel.empty:
+                if st_container is not None:
+                    status_text.text(f"Skipping (no band columns): {os.path.basename(cp)}")
+                continue
+        alpha = float(rel["alpha"].mean())
+        beta  = float(rel["beta"].mean())
+        theta = float(rel["theta"].mean())
+        delta = float(rel["delta"].mean())
+        gamma = float(rel["gamma"].mean())
+        stress = float(beta/(alpha+1e-9))
+        relax  = float(alpha/(beta+1e-9))
+        rows.append({
+            "datetime": dt,
+            "alpha": alpha,
+            "beta": beta,
+            "theta": theta,
+            "delta": delta,
+            "gamma": gamma,
+            "stress": stress,
+            "relax": relax,
+            "proc": did_proc,
+            "source": os.path.basename(cp)
+        })
+        if st_container is not None:
+            progress.progress(int(i/total*100))
+            status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
+    if st_container is not None:
+        progress.empty()
+        status_text.empty()
+    df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
+    if not df.empty:
+        df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
+    return df
+
 # ---------------- UI ----------------
 st.subheader("1) Datenquelle wählen")
-mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)"], horizontal=True)
+mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
 
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
 
-if mode.startswith("Datei-Upload"):
+# --- File upload ---
+if mode == "Datei-Upload (ZIP)":
     up = st.file_uploader("ZIP-Datei hochladen (Paket mit CSVs/SIPs)", type=["zip"])
     if up is not None:
         zbytes = up.read()
@@ -323,7 +389,8 @@ if mode.startswith("Datei-Upload"):
         except Exception as e:
             st.error(f"ZIP konnte nicht entpackt werden: {e}")
 
-elif mode.startswith("FTP"):
+# --- FTP ---
+elif mode == "FTP-Download":
     st.info("FTP unverschlüsselt. Für SFTP wähle SFTP-Option.")
     host = st.text_input("FTP-Host", value="ftp.example.com")
     user = st.text_input("Benutzer", value="anonymous")
@@ -347,7 +414,8 @@ elif mode.startswith("FTP"):
         except Exception as e:
             st.error(f"FTP-Fehler: {e}")
 
-elif mode.startswith("SFTP"):
+# --- SFTP ---
+elif mode == "SFTP (optional)":
     if not HAS_PARAMIKO:
         st.error("Paramiko nicht installiert. SFTP nicht verfügbar.")
     else:
@@ -375,7 +443,35 @@ elif mode.startswith("SFTP"):
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
-# ---------- Parameters / QC ----------
+# --- Dropbox ---
+elif mode == "Dropbox":
+    if not HAS_DROPBOX:
+        st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
+    else:
+        # default path from secrets or root
+        default_dropbox_path = "/"
+        if "dropbox" in st.secrets:
+            default_dropbox_path = st.secrets["dropbox"].get("path", default_dropbox_path)
+        token_from_secrets = st.secrets.get("dropbox", {}).get("access_token") if "dropbox" in st.secrets else ""
+        env_token = os.getenv("DROPBOX_TOKEN", "")
+        db_token_pref = token_from_secrets or env_token
+
+        db_token_input = st.text_input("Dropbox Access Token (nur wenn nicht in st.secrets)", value=db_token_pref, type="password")
+        dropbox_path = st.text_input("Dropbox-Ordner (z. B. /Psychotherapie/Brainzz/Sessions/Dailys)", value=default_dropbox_path)
+        if st.button("Dropbox Inhalte herunterladen"):
+            token_use = db_token_input or db_token_pref
+            if not token_use:
+                st.error("Access Token fehlt. Lege es in st.secrets oder als Umgebungsvariable DROPBOX_TOKEN ab.")
+            else:
+                with st.spinner("Lade von Dropbox..."):
+                    try:
+                        download_dropbox_folder(token_use, dropbox_path, workdir)
+                        recursively_extract_archives(workdir)
+                        st.success("Dropbox-Inhalte heruntergeladen und Archive extrahiert.")
+                    except Exception as e:
+                        st.error(f"Dropbox-Download fehlgeschlagen: {e}")
+
+# ---------------- Parameters / QC ----------------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
@@ -393,7 +489,7 @@ with st.expander("Hilfe zu Parametern", expanded=False):
 - Nur aktivieren wenn CSV Rohzeitreihen enthält. SciPy benötigt.
 
 **Was sind "Endsessions"?**  
-- "Endsessions" = die neuesten N Sessions. Das sind die zuletzt aufgezeichneten Messungen nach Timestamp.
+- "Endsessions" = die neuesten N Sessions nach Timestamp. Nützlich, um nur aktuelle Sessions zu markieren oder auszuwerten.
 """)
 
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
@@ -401,19 +497,18 @@ outlier_z = st.slider("Outlier z-Schwelle", min_value=1.5, max_value=5.0, value=
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=(True and HAS_SCIPY))
 
-# gather csvs recursively
+# ---------------- collect CSVs ----------------
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                  if os.path.isfile(p) and p.lower().endswith(".csv")]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
-
 st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
 MAX_PREPROC_MB = 200
 if total_mb > MAX_PREPROC_MB and do_preproc:
     st.warning(f"Preprocessing automatisch deaktiviert (Gesamt {total_mb:.0f} MB > {MAX_PREPROC_MB} MB).")
     do_preproc = False
 
-# ---------------- Session selection UI ----------------
+# ---------------- Session selection ----------------
 st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
 sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
 selected_csvs = csv_paths_all.copy()
@@ -448,7 +543,7 @@ elif sel_mode == "Letzte N Sessions":
 else:
     st.info(f"{len(selected_csvs)} Sessions (Alle)")
 
-# optional limiter
+# optional limiter for selected set
 limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
@@ -461,13 +556,15 @@ if limit_sessions and len(selected_csvs)>0:
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
         st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
 
-# compact info instead of preview
+# compact selection info
 st.info(f"{len(selected_csvs)} Sessions ausgewählt.")
 
 # ---------------- Run analysis ----------------
 if st.button("Auswertung starten"):
+    # ensure nested archives extracted
     recursively_extract_archives(workdir)
 
+    # refresh CSV list and resolve by basename
     csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                      if os.path.isfile(p) and p.lower().endswith(".csv")]
     csv_paths_all = sorted(csv_paths_all)
@@ -484,7 +581,7 @@ if st.button("Auswertung starten"):
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
 
     if len(resolved_selected) == 0:
-        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP neu hoch.")
+        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP/Dropbox-Inhalt neu hoch.")
     else:
         tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
         container = st.empty()
