@@ -346,110 +346,100 @@ elif mode == 'SFTP (optional)':
             except Exception as e:
                 st.error(f'SFTP-Fehler: {e}')
 
-# Dropbox (gepatcht): Auto-token/path aus st.secrets, robustes probing + Navigation
-# ---------------- Dropbox (ersetzt bisherigen Dropbox-Block) ----------------
+# ---------------- Dropbox: manuelle Dateiauswahl (ersetze bisherigen Dropbox-Block) ----------------
 elif mode == 'Dropbox':
     if not HAS_DROPBOX:
         st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
     else:
+        # Token + konfigurierte Pfadquelle (falls nicht in st.secrets gesetzt, default auf Sessions-Pfad)
         token = st.secrets.get('dropbox', {}).get('access_token') if 'dropbox' in st.secrets else os.getenv('DROPBOX_TOKEN')
-        configured_path = st.secrets.get('dropbox', {}).get('path') if 'dropbox' in st.secrets else None
-        # If not set, treat as app-root
-        if configured_path is None:
-            configured_path = ''
+        configured_path = st.secrets.get('dropbox', {}).get('path') if 'dropbox' in st.secrets else "/Psychotherapie/Brainzz/Sessions"
+
+        # Normalisiere Benutzerpfad zu Form, die Dropbox SDK erwartet:
+        # -> ''  (app-root)  OR  '/something' (mit führendem slash)
+        def normalize_api_path(p):
+            if p is None:
+                return ''
+            s = str(p).strip().replace('\\', '/')
+            if s == '' or s == '/':
+                return ''
+            # remove repeated slashes, ensure single leading slash
+            s = '/' + s.strip('/')
+            return s
 
         if not token:
-            st.error('Dropbox-Token nicht gefunden. Lege access_token in st.secrets oder DROPBOX_TOKEN als Env an.')
+            st.error('Dropbox-Token nicht gefunden. Lege access_token in st.secrets["dropbox"] oder als DROPBOX_TOKEN Umgebungsvariable an.')
         else:
             st.markdown(f"**Dropbox-Ordner (konfiguriert):** `{configured_path if configured_path!='' else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # Normalisiere in Form, die Dropbox SDK erwartet:
-            # -> ''   (app-root) OR string starting with '/'
-            def normalize_api_path(p):
-                if p is None:
-                    return ''
-                s = str(p).strip()
-                if s == '' or s == '/':
-                    return ''
-                return s if s.startswith('/') else '/' + s
+            if st.button('Ordner öffnen'):
+                api_path = normalize_api_path(configured_path)
 
-            # Versucht eine Liste von Kandidaten in Reihenfolge und liefert ersten Treffer
-            def try_path_candidates(dbx, cand_list):
-                from dropbox.exceptions import ApiError
-                for cand in cand_list:
-                    api_p = normalize_api_path(cand)
+                # Try listing and handle common Dropbox errors cleanly
+                try:
+                    entries = dbx.files_list_folder(api_path, recursive=False)
+                    entries = entries.entries
+                except dropbox.exceptions.AuthError as e:
+                    st.error("AuthError: Token hat nicht die nötigen Scopes. Aktiviere files.metadata.read + files.content.read und generiere ein neues Token.")
+                    entries = []
+                except dropbox.exceptions.ApiError as e:
+                    # spezifischere Diagnose für not_found vs. andere Fehler
                     try:
-                        res = dbx.files_list_folder(api_p, recursive=False)
-                        return api_p, res.entries
-                    except ApiError:
-                        # Pfad existiert nicht oder fehlende Rechte -> nächster Kandidat
-                        continue
+                        if hasattr(e.error, 'get_path') and e.error.get_path() is not None and e.error.get_path().is_not_found():
+                            st.error("Pfad nicht gefunden. Prüfe st.secrets['dropbox']['path'] (App-folder vs Full Dropbox).")
+                        else:
+                            st.error(f"Dropbox ApiError: {e.error_summary}")
                     except Exception:
-                        # andere Fehler ebenfalls überspringen und weiterversuchen
-                        continue
-                return None, []
+                        st.error(f"Dropbox ApiError: {e}")
+                    entries = []
+                except Exception as e:
+                    st.error(f"Unbekannter Dropbox-Fehler: {e}")
+                    entries = []
 
-            # Baue Kandidatenliste: priorisiere Dailys unter configured_path,
-            # teste aber auch plausible Alternativen und App-root
-            c = configured_path or ''
-            candidates = []
-            # 1) configured + '/Dailys'  (z. B. /Psychotherapie/Brainzz/Dailys)
-            if c not in ('', '/'):
-                candidates.append(os.path.join(c, 'Dailys').replace('\\', '/'))
-            # 2) configured itself
-            if c not in ('', '/'):
-                candidates.append(c)
-            # 3) absolute common guess if configured contains 'Brainzz'
-            if 'Brainzz' in c and not c.endswith('Dailys'):
-                candidates.append(c + '/Dailys')
-            # 4) top-level /Dailys (app-root case or full-dropbox)
-            candidates.append('/Dailys')
-            # 5) app-root (empty string) and full-root '/'
-            candidates.append('')
-            candidates.append('/')
-
-            api_path, entries = try_path_candidates(dbx, candidates)
-
-            if api_path is None:
-                st.error("Pfad nicht gefunden. Prüfe st.secrets['dropbox']['path'] oder setze testweise path = '' (app-root).")
-            else:
-                # save working api path
-                st.session_state['db_current_api_path'] = api_path
+                # Falls listing erfolgreich, trenne Ordner und Dateien
                 folders = [e for e in entries if isinstance(e, dropbox.files.FolderMetadata)]
-                files = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
+                files   = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
 
-                # Falls wir landeten auf configured+'/Dailys' oder '/Dailys', informiere
-                if api_path.endswith('/Dailys'):
-                    st.success(f"Verwendeter Ordner: {api_path}")
+                # Wenn keine direkten Dateien, Hinweis geben (keine automatische Rekursion)
+                if not files and not folders:
+                    st.info("0 Datei(en) und 0 Ordner im aktuellen Ordner. (Die App listet nur direkte Einträge, nicht rekursiv.)")
 
-                # Zeige Unterordner als Buttons (Navigation)
+                # Ordner anzeigen (Buttons zum Navigieren, falls gewünscht)
                 if folders:
-                    st.write('Ordner:')
+                    st.write("Ordner:")
                     for f in sorted(folders, key=lambda x: x.name):
                         if st.button(f"Öffnen: {f.name}", key=f"open_{f.path_lower}"):
-                            st.session_state['db_current_api_path'] = f.path_lower
+                            # setze neuen configured path in session und lade neu
+                            st.session_state['db_chosen_path'] = f.path_lower
+                            # update configured_path for next listing
+                            configured_path = f.path_display
                             st.experimental_rerun()
 
-                # Zeige Dateien als Auswahl
+                # Dateien filtern - nur ZIP und CSV anzeigen (anpassbar)
                 if files:
-                    opts = [f.path_display for f in files]
-                    sel = st.multiselect('Wähle Dateien', opts)
-                    if st.button('Herunterladen ausgewählter Dateien'):
-                        downloaded = []
-                        for disp in sel:
-                            remote = next((x.path_lower for x in files if x.path_display == disp), None)
-                            if remote:
+                    visible_files = [f for f in files if f.name.lower().endswith(('.zip', '.csv'))]
+                    if not visible_files:
+                        st.info("Es gibt Dateien, aber keine ZIP/CSV in diesem Ordner.")
+                    else:
+                        options = [f.path_display for f in visible_files]
+                        sel = st.multiselect("Wähle eine oder mehrere Dateien zum Herunterladen (ZIP/CSV)", options)
+                        if st.button("Herunterladen ausgewählter Dateien"):
+                            downloaded = []
+                            for disp in sel:
+                                remote_lower = next((x.path_lower for x in visible_files if x.path_display == disp), None)
+                                if not remote_lower:
+                                    st.error(f"Datei nicht gefunden (intern): {disp}")
+                                    continue
                                 try:
-                                    lp = download_dropbox_file(token, remote, workdir)
+                                    lp = download_dropbox_file(token, remote_lower, workdir)
                                     downloaded.append(lp)
                                 except Exception as e:
                                     st.error(f"Download fehlgeschlagen: {disp} — {e}")
-                        if downloaded:
-                            recursively_extract_archives(workdir)
-                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
-                if not folders and not files:
-                    st.info('0 Datei(en) gefunden.')
+                            if downloaded:
+                                recursively_extract_archives(workdir)
+                                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
+
 
 # ---------------- Parameters / QC ----------------
 st.subheader('2) Parameter / QC')
