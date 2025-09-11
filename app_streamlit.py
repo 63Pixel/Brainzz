@@ -427,7 +427,52 @@ elif mode == "Dropbox":
                 files = []
 
             # Nur ZIP/CSV/SIP anzeigen
-           visible_files 
+            # --- Dateien im konfigurierten Dropbox-Ordner listen (files vorhanden) ---
+visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
+
+st.session_state.setdefault("db_files_map", [])
+st.session_state.setdefault("select_all_master", False)
+
+if visible_files:
+    files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
+    st.session_state["db_files_map"] = files_map
+
+    # Callback setzt alle Einzel-Checkboxen auf den Master-Wert
+    def _apply_select_all():
+        val = st.session_state.get("select_all_master", False)
+        for i in range(len(files_map)):
+            st.session_state[f"chk_{i}"] = val
+
+    st.checkbox("Alle auswählen", key="select_all_master", on_change=_apply_select_all)
+
+    # Einzel-Checkboxen rendern (keine Zuweisung an session_state!)
+    for i, (disp, _remote) in enumerate(files_map):
+        key = f"chk_{i}"
+        st.checkbox(disp, key=key)  # Streamlit verwaltet den State
+
+    # Auswahl einsammeln NACH dem Rendern
+    selected_pairs = []
+    for i, (disp, remote) in enumerate(files_map):
+        if st.session_state.get(f"chk_{i}", False):
+            selected_pairs.append((disp, remote))
+
+    if st.button("Herunterladen ausgewählter Dateien"):
+        if not selected_pairs:
+            st.warning("Keine Datei ausgewählt.")
+        else:
+            downloaded = []
+            for disp, remote in selected_pairs:
+                try:
+                    lp = download_dropbox_file(token, remote, workdir)
+                    downloaded.append(lp)
+                except Exception as e:
+                    st.error(f"Download fehlgeschlagen: {disp} — {e}")
+            if downloaded:
+                recursively_extract_archives(workdir)
+                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
+else:
+    st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+
 
 
 
