@@ -1,10 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # EEG-Auswertung Streamlit App
-# - Dropbox: kein Verzeichniswechsel, nur Dateien im konfigurierten Ordner
-# - Checkbox "Alle auswählen" + Multiselect
-# - ZIP/SIP werden nach Download rekursiv extrahiert
-# - Analyse (Stress/Entspannung, Bänder, FAA)
 
 import os, io, re, glob, zipfile, tempfile, shutil
 from datetime import datetime, timedelta
@@ -196,6 +192,7 @@ def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
 
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
     rows=[]
+    failed_files=[]
     total = max(1, len(csv_paths))
     if st_container is not None:
         progress = st_container.progress(0)
@@ -203,12 +200,14 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     for i, cp in enumerate(sorted(csv_paths), start=1):
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
         if dt is None:
+            failed_files.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel im Namen."})
             if st_container is not None:
                 st_container.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Ungültiger Zeitstempel im Namen.")
             continue
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
         rel = load_session_relatives(proc_path) or load_session_relatives(cp)
         if rel is None or rel.empty:
+            failed_files.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten gefunden."})
             if st_container is not None:
                 st_container.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Keine gültigen Bandspalten gefunden.")
             continue
@@ -224,11 +223,8 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     if st_container is not None:
         progress.empty(); status_text.empty()
     df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df = df.dropna().sort_values("datetime").reset_index(drop=True)
     if not df.empty: df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
-    return df
+    return df, failed_files
 
 # --------- UI: Quelle ---------
 st.subheader("1) Datenquelle wählen")
@@ -440,13 +436,12 @@ if st.button("Auswertung starten"):
     else:
         tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
         container = st.empty()
-        df = build_session_table_from_list(selected_csvs, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
+        df, failed_files = build_session_table_from_list(selected_csvs, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
         try: shutil.rmtree(tmpdir)
         except Exception: pass
 
-        if df.empty:
-            st.error("Keine gültigen Sessions mit Bandspalten gefunden.")
-        else:
+        # **Neue Logik:**
+        if not df.empty:
             faa_list = []
             for cp in selected_csvs:
                 faa = try_compute_faa_from_csv(cp)
@@ -474,3 +469,9 @@ if st.button("Auswertung starten"):
             st.download_button("Summary CSV herunterladen",
                                data=df_out.to_csv(index=False).encode("utf-8"),
                                file_name="summary_indices.csv", mime="text/csv")
+        
+        # **Ausgabe der fehlgeschlagenen Dateien:**
+        if failed_files:
+            st.subheader("Folgende Dateien wurden übersprungen:")
+            for f in failed_files:
+                st.warning(f"**{f['source']}**: {f['reason']}")
