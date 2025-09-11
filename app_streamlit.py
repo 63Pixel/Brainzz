@@ -372,7 +372,9 @@ elif mode == 'Dropbox':
             dbx = dropbox.Dropbox(token, timeout=300)
 
             # probe_candidates tries several possible API paths until one works
-            def probe_candidates(dbx, configured):
+          from dropbox.exceptions import ApiError
+
+def probe_candidates(dbx, configured):
     """
     Versucht mehrere Kandidaten für den API-Pfad.
     Liefert (api_path, entries) oder (None, []) wenn nichts passt.
@@ -418,6 +420,7 @@ elif mode == 'Dropbox':
             continue
 
     return None, []
+
 
             if st.button('Ordner öffnen'):
                 api_path, entries = probe_candidates(dbx, configured_path)
