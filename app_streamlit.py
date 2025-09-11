@@ -2,16 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 EEG-Auswertung Streamlit App
-Features:
-- Datei-Upload / FTP / SFTP / Dropbox (Dropbox-Token via st.secrets oder env)
-- Rekursive Extraktion von .zip und .sip (auch verschachtelt)
-- Robustere CSV-Erkennung
-- Session-Auswahl: Alle / Letzte Tage / Letzte N Sessions
-- Hilfe-Expander standardmäßig eingeklappt
-- CSS für Expander- und Badge-Farben (einfach anpassbar)
-- Plotly-Interaktive Diagramme (Stress/Entspannung, Bänder)
-- Optionales Rohdaten-Preprocessing, wenn SciPy verfügbar
-Save as app_streamlit.py and run with `streamlit run app_streamlit.py`.
+- Dropbox: Auto-Lesen von st.secrets (access_token + path)
+- "Ordner öffnen" zeigt Dateiliste; Mehrfachauswahl möglich
+- "Herunterladen ausgewählter Dateien" lädt ausgewählte Dateien in das workdir
+- Keine Token/Path Eingabefelder mehr im UI
 """
 import os
 import io
@@ -44,6 +38,7 @@ except Exception:
 # Dropbox SDK (optional)
 try:
     import dropbox
+    from dropbox.files import FileMetadata, FolderMetadata
     HAS_DROPBOX = True
 except Exception:
     HAS_DROPBOX = False
@@ -53,19 +48,16 @@ st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 # ---------------- Styling (edit hex values here) ----------------
 st.markdown("""
 <style>
-/* Badges */
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;color:#fff;font-size:12px;margin-right:8px}
 .badge-recent{background:#ff8c00}
 .badge-newest{background:#28a745}
 .badge-both{background:#6f42c1}
 .session-row{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
-
-/* Expander colors (change variables below) */
 :root{
-  --expander-bg: #e9ecef;        /* background when closed */
-  --expander-text: #0b3d91;      /* text when closed */
-  --expander-open-bg: #28a745;   /* background when open */
-  --expander-open-text: #ffffff; /* text when open */
+  --expander-bg: #e9ecef;
+  --expander-text: #0b3d91;
+  --expander-open-bg: #28a745;
+  --expander-open-text: #ffffff;
 }
 div.stExpander > div[data-testid="stExpander"] > details > summary,
 details > summary {
@@ -85,12 +77,10 @@ div.stExpander[open] > summary {
 """, unsafe_allow_html=True)
 
 st.title("EEG-Auswertung")
-st.caption("Upload/Dropbox/FTP/SFTP → Sessions auswählen → Auswertung starten")
+st.caption("Upload/FTP/SFTP/Dropbox → Ordner öffnen → Dateien wählen → Auswertung starten")
 
 # ---------------- Filename timestamp parsing ----------------
-# expected filename pattern: brainzz_YYYY-MM-DD--HH-MM-SS
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
-
 def parse_dt_from_path(path):
     m = PAT.search(path)
     if not m:
@@ -106,14 +96,12 @@ def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
         return x
     b,a = iirnotch(f0, Q, fs)
     return filtfilt(b,a,x)
-
 def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     if not HAS_SCIPY:
         return x
     nyq = fs/2.0
     b,a = butter(order, [low/nyq, high/nyq], btype='band')
     return filtfilt(b,a,x)
-
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -136,7 +124,6 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     out_path = os.path.join(out_tmp_dir, os.path.basename(csv_path).replace(".csv","_proc.csv"))
     proc.to_csv(out_path, index=False)
     return out_path, True
-
 def load_session_relatives(csv_path):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -162,30 +149,12 @@ def load_session_relatives(csv_path):
     rel = rel.div(total, axis=0).dropna()
     return rel
 
-def try_compute_faa_from_csv(csv_path):
-    try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception:
-        return None
-    left_keys = [k for k in df.columns if "alpha" in k.lower() and ("left" in k.lower() or "fp1" in k.lower() or "f3" in k.lower())]
-    right_keys = [k for k in df.columns if "alpha" in k.lower() and ("right" in k.lower() or "fp2" in k.lower() or "f4" in k.lower())]
-    if left_keys and right_keys:
-        left = df[left_keys].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        right = df[right_keys].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        return np.log(right+1e-9) - np.log(left+1e-9)
-    return None
-
 # ---------------- Plot helpers ----------------
 def plot_single_session_interactive(df):
-    vals = {
-        "Stress": df["stress"].iloc[0],
-        "Entspannung": df["relax"].iloc[0],
-        "Delta": df["delta"].iloc[0],
-        "Theta": df["theta"].iloc[0],
-        "Alpha": df["alpha"].iloc[0],
-        "Beta": df["beta"].iloc[0],
-        "Gamma": df["gamma"].iloc[0],
-    }
+    vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
+            "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
+            "Alpha": df["alpha"].iloc[0], "Beta": df["beta"].iloc[0],
+            "Gamma": df["gamma"].iloc[0]}
     data = pd.DataFrame({"Metrik": list(vals.keys()), "Wert": list(vals.values())})
     fig = px.bar(data, x="Metrik", y="Wert", color="Metrik", text="Wert", height=360)
     fig.update_traces(texttemplate="%{text:.2f}", textposition="outside", showlegend=False)
@@ -222,10 +191,9 @@ def plot_bands(df, smooth=5):
         d[f"{c}_trend"] = d[c].rolling(window=smooth, center=True, min_periods=1).mean()
     cols = ["delta_trend","theta_trend","alpha_trend","beta_trend","gamma_trend","stresswave_trend","relaxwave_trend"]
     long_df = d.melt(id_vars=["date_str"], value_vars=cols, var_name="Band", value_name="Wert")
-    mapping = {
-        "delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta","gamma_trend":"Gamma",
-        "stresswave_trend":"Stress-Welle (Beta+Gamma)","relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"
-    }
+    mapping = {"delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta",
+               "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)",
+               "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
     long_df["Band"] = long_df["Band"].map(mapping)
     fig = px.line(long_df, x="date_str", y="Wert", color="Band", markers=True, height=380)
     fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0,1]))
@@ -234,10 +202,6 @@ def plot_bands(df, smooth=5):
 
 # ---------------- Recursive extraction ----------------
 def recursively_extract_archives(root_dir):
-    """
-    Extract .zip and .sip recursively. Mark extracted archives by renaming them to .extracted
-    to avoid infinite loops.
-    """
     changed = True
     while changed:
         changed = False
@@ -264,60 +228,36 @@ def recursively_extract_archives(root_dir):
             except Exception:
                 continue
 
-# ---------------- Dropbox helper ----------------
-def download_dropbox_folder(dbx_token: str, dropbox_path: str, local_dir: str):
-    """
-    Download all files and subfolders from dropbox_path into local_dir.
-    Requires dropbox SDK and a valid token. Does not store token.
-    """
+# ---------------- Dropbox helpers ----------------
+def list_dropbox_folder(dbx_token: str, dropbox_path: str):
     if not HAS_DROPBOX:
         raise RuntimeError("Dropbox SDK nicht installiert.")
     dbx = dropbox.Dropbox(dbx_token, timeout=300)
+    try:
+        res = dbx.files_list_folder(dropbox_path, recursive=False)
+    except Exception as e:
+        raise
+    entries = res.entries[:]
+    while res.has_more:
+        res = dbx.files_list_folder_continue(res.cursor)
+        entries.extend(res.entries)
+    return entries
 
-    def list_folder(path):
-        res = dbx.files_list_folder(path, recursive=False)
-        entries = res.entries[:]
-        while res.has_more:
-            res = dbx.files_list_folder_continue(res.cursor)
-            entries.extend(res.entries)
-        return entries
-
-    os.makedirs(local_dir, exist_ok=True)
-    stack = [dropbox_path]
-    while stack:
-        cur = stack.pop()
+def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
+    dbx = dropbox.Dropbox(dbx_token, timeout=300)
+    local_path = os.path.join(local_dir, os.path.basename(remote_path))
+    # overwrite allowed
+    try:
+        md, res = dbx.files_download(remote_path)
+        with open(local_path, "wb") as f:
+            f.write(res.content)
+    except Exception:
+        # fallback chunked
         try:
-            entries = list_folder(cur)
-        except Exception:
-            # If cur is a file path, try download directly
-            try:
-                md, res = dbx.files_download(cur)
-                name = os.path.basename(cur)
-                local_path = os.path.join(local_dir, name)
-                with open(local_path, "wb") as f:
-                    f.write(res.content)
-                continue
-            except Exception:
-                continue
-
-        for ent in entries:
-            # File metadata
-            if isinstance(ent, dropbox.files.FileMetadata):
-                local_path = os.path.join(local_dir, os.path.basename(ent.path_display))
-                if os.path.exists(local_path):
-                    continue
-                try:
-                    md, res = dbx.files_download(ent.path_lower)
-                    with open(local_path, "wb") as f:
-                        f.write(res.content)
-                except Exception:
-                    try:
-                        dbx.files_download_to_file(local_path, ent.path_lower)
-                    except Exception:
-                        pass
-            # Folder metadata
-            elif isinstance(ent, dropbox.files.FolderMetadata):
-                stack.append(ent.path_lower)
+            dbx.files_download_to_file(local_path, remote_path)
+        except Exception as e:
+            raise
+    return local_path
 
 # ---------------- build session table ----------------
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
@@ -443,33 +383,58 @@ elif mode == "SFTP (optional)":
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
-# --- Dropbox ---
+# --- Dropbox (auto token/path from st.secrets) ---
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
         st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
     else:
-        # default path from secrets or root
-        default_dropbox_path = "/"
+        # automatic token/path from st.secrets (no UI inputs)
+        token = None
+        path = "/"
         if "dropbox" in st.secrets:
-            default_dropbox_path = st.secrets["dropbox"].get("path", default_dropbox_path)
-        token_from_secrets = st.secrets.get("dropbox", {}).get("access_token") if "dropbox" in st.secrets else ""
-        env_token = os.getenv("DROPBOX_TOKEN", "")
-        db_token_pref = token_from_secrets or env_token
+            token = st.secrets["dropbox"].get("access_token")
+            path = st.secrets["dropbox"].get("path", path)
+        if not token:
+            # fallback to env
+            token = os.getenv("DROPBOX_TOKEN", None)
 
-        db_token_input = st.text_input("Dropbox Access Token (nur wenn nicht in st.secrets)", value=db_token_pref, type="password")
-        dropbox_path = st.text_input("Dropbox-Ordner (z. B. /Psychotherapie/Brainzz/Sessions/Dailys)", value=default_dropbox_path)
-        if st.button("Dropbox Inhalte herunterladen"):
-            token_use = db_token_input or db_token_pref
-            if not token_use:
-                st.error("Access Token fehlt. Lege es in st.secrets oder als Umgebungsvariable DROPBOX_TOKEN ab.")
-            else:
-                with st.spinner("Lade von Dropbox..."):
-                    try:
-                        download_dropbox_folder(token_use, dropbox_path, workdir)
-                        recursively_extract_archives(workdir)
-                        st.success("Dropbox-Inhalte heruntergeladen und Archive extrahiert.")
-                    except Exception as e:
-                        st.error(f"Dropbox-Download fehlgeschlagen: {e}")
+        if not token:
+            st.error("Dropbox-Token nicht gefunden. Lege access_token in st.secrets['dropbox'] oder DROPBOX_TOKEN als Env an.")
+        else:
+            st.markdown(f"**Dropbox-Ordner (konfiguriert):** `{path}`")
+            if st.button("Ordner öffnen"):
+                try:
+                    entries = list_dropbox_folder(token, path)
+                    # build mapping display -> remote path
+                    files_only = [e for e in entries if isinstance(e, FileMetadata)]
+                    # store mapping in session_state
+                    st.session_state["db_files_map"] = {e.path_display: e.path_lower for e in files_only}
+                    st.success(f"{len(files_only)} Datei(en) gefunden.")
+                except Exception as e:
+                    st.error(f"Ordner-Liste fehlgeschlagen: {e}")
+
+            if "db_files_map" in st.session_state and st.session_state["db_files_map"]:
+                files_map = st.session_state["db_files_map"]
+                options = list(files_map.keys())
+                selected = st.multiselect("Wähle eine oder mehrere Dateien zum Herunterladen", options, default=[])
+                if st.checkbox("Alle auswählen"):
+                    selected = options
+                if selected:
+                    if st.button("Herunterladen ausgewählter Dateien"):
+                        downloaded = []
+                        with st.spinner("Lade ausgewählte Dateien herunter..."):
+                            for disp in selected:
+                                remote = files_map[disp]
+                                try:
+                                    lp = download_dropbox_file(token, remote, workdir)
+                                    downloaded.append(lp)
+                                except Exception as e:
+                                    st.error(f"Download fehlgeschlagen: {disp}  —  {e}")
+                        if downloaded:
+                            recursively_extract_archives(workdir)
+                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und Archive extrahiert.")
+                        else:
+                            st.warning("Keine Dateien erfolgreich heruntergeladen.")
 
 # ---------------- Parameters / QC ----------------
 st.subheader("2) Parameter / QC")
@@ -489,9 +454,8 @@ with st.expander("Hilfe zu Parametern", expanded=False):
 - Nur aktivieren wenn CSV Rohzeitreihen enthält. SciPy benötigt.
 
 **Was sind "Endsessions"?**  
-- "Endsessions" = die neuesten N Sessions nach Timestamp. Nützlich, um nur aktuelle Sessions zu markieren oder auszuwerten.
+- "Endsessions" = die neuesten N Sessions nach Timestamp.
 """)
-
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
 outlier_z = st.slider("Outlier z-Schwelle", min_value=1.5, max_value=5.0, value=3.0, step=0.5)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
@@ -512,7 +476,6 @@ if total_mb > MAX_PREPROC_MB and do_preproc:
 st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
 sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
 selected_csvs = csv_paths_all.copy()
-
 if sel_mode == "Letzte Tage":
     days_opt = st.selectbox("Zeitraum", ["1 Tag", "3 Tage", "7 Tage", "14 Tage"], index=2)
     days_map = {"1 Tag":1, "3 Tage":3, "7 Tage":7, "14 Tage":14}
@@ -525,7 +488,6 @@ if sel_mode == "Letzte Tage":
             selected.append(p)
     selected_csvs = sorted(selected)
     st.info(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
-
 elif sel_mode == "Letzte N Sessions":
     parsed = [(p, parse_dt_from_path(p)) for p in csv_paths_all]
     parsed = [t for t in parsed if t[1] is not None]
@@ -539,11 +501,9 @@ elif sel_mode == "Letzte N Sessions":
         n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n, value=default_n, step=1)
         selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
         st.info(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
-
 else:
     st.info(f"{len(selected_csvs)} Sessions (Alle)")
 
-# optional limiter for selected set
 limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
@@ -555,21 +515,15 @@ if limit_sessions and len(selected_csvs)>0:
         parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
         st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
-
-# compact selection info
 st.info(f"{len(selected_csvs)} Sessions ausgewählt.")
 
 # ---------------- Run analysis ----------------
 if st.button("Auswertung starten"):
-    # ensure nested archives extracted
     recursively_extract_archives(workdir)
-
-    # refresh CSV list and resolve by basename
     csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                      if os.path.isfile(p) and p.lower().endswith(".csv")]
     csv_paths_all = sorted(csv_paths_all)
     basenames_map = {os.path.basename(p): p for p in csv_paths_all}
-
     resolved_selected = []
     for p in selected_csvs:
         b = os.path.basename(p)
@@ -577,9 +531,7 @@ if st.button("Auswertung starten"):
             resolved_selected.append(basenames_map[b])
     if not resolved_selected:
         resolved_selected = csv_paths_all
-
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
-
     if len(resolved_selected) == 0:
         st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP/Dropbox-Inhalt neu hoch.")
     else:
@@ -590,7 +542,6 @@ if st.button("Auswertung starten"):
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-
         if df.empty:
             st.error("Keine gültigen Sessions (mit Bandspalten) gefunden. Prüfe Dateiformat.")
         else:
@@ -600,7 +551,6 @@ if st.button("Auswertung starten"):
                 if faa is not None:
                     faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
             faa_df = pd.DataFrame(faa_list)
-
             if len(df) == 1:
                 st.subheader("Einzel-Session Analyse")
                 st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
@@ -614,7 +564,6 @@ if st.button("Auswertung starten"):
                 st.plotly_chart(plot_bands(df, smooth=smooth), use_container_width=True)
                 st.subheader("Session Übersicht (Tabelle)")
                 st.dataframe(df.round(4))
-
             df_out = df.copy()
             df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
             st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
