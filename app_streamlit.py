@@ -33,7 +33,6 @@ try:
 except Exception:
     HAS_DROPBOX = False
 
-# ---------- Streamlit setup ----------
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
 st.caption("ZIP/FTP/SFTP/Dropbox → Dateien wählen → Auswertung starten")
@@ -42,24 +41,17 @@ st.caption("ZIP/FTP/SFTP/Dropbox → Dateien wählen → Auswertung starten")
 st.markdown("""
 <style>
 :root{ --expander-bg:#e9ecef; --expander-text:#0b3d91; --expander-open-bg:#28a745; --expander-open-text:#fff }
-details > summary{ background:var(--expander-bg)!important; font-size:12px; font-weight:bold; color:var(--expander-text);
-  padding:0.5em 1em; margin-bottom:1em; border-radius:0.5em; border:1px solid #ced4da; transition:all .2s }
-details[open] > summary{ background:var(--expander-open-bg)!important; color:var(--expander-open-text); border:1px solid var(--expander-open-bg) }
-details > summary::-webkit-details-marker{ display:none }
-div[data-baseweb="select"]{ font-size:12px!important } div[role="listbox"]{ max-height:300px!important; font-size:12px!important }
-.ag-theme-streamlit-dark, .ag-theme-alpine{ --ag-font-size:12px; --ag-list-item-height:24px }
+details > summary{ background:var(--expander-bg)!important; font-size:12px; font-weight:bold; color:var(--expander-text); padding:0.5em 1em; margin-bottom:1em; border-radius:0.5em; border:1px solid #ced4da; transition:all 0.2s ease-in-out }
+details[open] > summary{ background:var(--expander-open-bg)!important; color:var(--expander-open-text); border:1px solid var(--expander-open-bg); }
+details > summary::-webkit-details-marker{ display:none; }
+div[data-baseweb="select"] { font-size:12px !important; }
+div[role="listbox"]{ max-height:300px !important; font-size:12px !important; }
+.ag-theme-streamlit-dark, .ag-theme-alpine{ --ag-font-size:12px; --ag-list-item-height:24px; }
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Workdir persistent ----------
-def get_workdir():
-    if "workdir" not in st.session_state:
-        st.session_state["workdir"] = tempfile.mkdtemp(prefix="eeg_works_")
-    return st.session_state["workdir"]
 
-workdir = get_workdir()
-
-# ---------- Helpers ----------
+# --------- Helpers ----------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path: str):
@@ -80,16 +72,12 @@ def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     return filtfilt(b,a,x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
-    # wenn bereits Bänder-Spalten vorhanden → keine Filterung nötig
-    try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception:
-        return csv_path, False
+    try: df = pd.read_csv(csv_path, low_memory=False)
+    except Exception: return csv_path, False
     band_prefixes = ("Delta_","Theta_","Alpha_","Beta_","Gamma_")
     non_band = [c for c in df.columns if not str(c).startswith(band_prefixes)]
     numeric = [c for c in non_band if np.issubdtype(df[c].dtype, np.number)]
-    if len(numeric)<2 or len(df)<10 or not HAS_SCIPY or fs <= 0:
-        return csv_path, False
+    if len(numeric)<2 or len(df)<10 or not HAS_SCIPY: return csv_path, False
     proc = df.copy()
     for c in numeric:
         try:
@@ -97,43 +85,60 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
             sig = notch_filter_signal(sig, fs=fs)
             sig = bandpass_signal(sig, fs=fs)
             proc[c] = sig
-        except Exception:
-            pass
+        except Exception: pass
     outp = os.path.join(out_tmp_dir, os.path.basename(csv_path).replace(".csv","_proc.csv"))
     proc.to_csv(outp, index=False)
     return outp, True
 
-def load_session_relatives(csv_path):
+def load_csv(path):
+    """
+    Lädt eine CSV-Datei und überspringt fehlerhafte Zeilen, die Probleme verursachen.
+    """
     try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception:
+        # read_csv mit error_bad_lines=False, um problematische Zeilen zu ignorieren
+        df = pd.read_csv(path, sep=',', on_bad_lines='skip')
+        # Bereinigen von Spaltennamen (entfernen von Leerzeichen)
+        df.columns = df.columns.str.strip()
+        # Stellen Sie sicher, dass die "TimeStamp"-Spalte vorhanden ist
+        if 'TimeStamp' in df.columns:
+            df['datetime'] = pd.to_datetime(df['TimeStamp'], errors='coerce')
+        return df
+    except Exception as e:
+        st.error(f"Fehler beim Laden von {os.path.basename(path)}: {e}")
         return None
-    bands = ["Delta","Theta","Alpha","Beta","Gamma"]
-    cols = {b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else []) for b in bands}
-    if not all(cols[b] for b in bands):
-        return None
-    sums = {}
-    for b in bands:
-        try:
-            sums[b.lower()] = df[cols[b]].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-        except Exception:
-            return None
-    rel = pd.DataFrame(sums).replace([np.inf,-np.inf], np.nan).dropna()
-    tot = rel.sum(axis=1).replace(0, np.nan)
-    return rel.div(tot, axis=0).dropna()
 
-def try_compute_faa_from_csv(csv_path):
-    try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception:
+def try_compute_faa_from_csv(path):
+    """
+    Versucht, den Frontal Alpha Asymmetry (FAA)-Wert aus einer CSV-Datei zu berechnen.
+    """
+    df = load_csv(path)
+    if df is None:
         return None
-    L = [k for k in df.columns if "alpha" in k.lower() and any(tag in k.lower() for tag in ["left","fp1","f3"])]
-    R = [k for k in df.columns if "alpha" in k.lower() and any(tag in k.lower() for tag in ["right","fp2","f4"])]
-    if L and R:
-        left = df[L].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        right= df[R].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        return np.log(right+1e-9)-np.log(left+1e-9)
-    return None
+
+    # Suchen Sie nach Spaltennamen, die mit Alpha beginnen, um linke und rechte Alpha-Werte zu finden
+    alpha_cols = [c for c in df.columns if 'Alpha' in c]
+    if not alpha_cols:
+        st.warning(f"Keine Alpha-Spalten in {os.path.basename(path)} gefunden. FAA kann nicht berechnet werden.")
+        return None
+    
+    # Vereinfachte Annahme: Wir finden die ersten beiden Alpha-Spalten, die linke und rechte Hemisphäre repräsentieren könnten
+    # In einem komplexeren Fall wäre eine Zuordnung von Kanälen erforderlich
+    if len(alpha_cols) < 2:
+        st.warning(f"Nicht genug Alpha-Spalten in {os.path.basename(path)} für FAA-Berechnung gefunden.")
+        return None
+        
+    alpha_left = df[alpha_cols[0]]
+    alpha_right = df[alpha_cols[1]]
+    
+    # Vermeiden Sie eine Division durch Null und behandeln Sie leere oder NaN-Werte
+    if alpha_left.isnull().all() or alpha_right.isnull().all():
+        st.warning(f"Alpha-Spalten in {os.path.basename(path)} enthalten nur leere Werte. FAA kann nicht berechnet werden.")
+        return None
+
+    alpha_left_avg = np.log(alpha_left.mean())
+    alpha_right_avg = np.log(alpha_right.mean())
+    faa = alpha_right_avg - alpha_left_avg
+    return faa
 
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
@@ -163,12 +168,10 @@ def plot_bands(df, smooth=5):
     for c in ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]:
         d[f"{c}_trend"] = d[c].rolling(window=smooth, center=True, min_periods=1).mean()
     long = d.melt(id_vars=["date_str"],
-                  value_vars=["delta_trend","theta_trend","alpha_trend","beta_trend",
-                              "gamma_trend","stresswave_trend","relaxwave_trend"],
+                  value_vars=["delta_trend","theta_trend","alpha_trend","beta_trend","gamma_trend","stresswave_trend","relaxwave_trend"],
                   var_name="Band", value_name="Wert")
     mapn = {"delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta",
-            "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)",
-            "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
+            "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)","relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
     long["Band"] = long["Band"].map(mapn)
     fig = px.line(long, x="date_str", y="Wert", color="Band", markers=True, height=380)
     fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0,1]))
@@ -181,16 +184,12 @@ def recursively_extract_archives(root_dir):
         archives = [p for p in glob.glob(os.path.join(root_dir,"**","*"), recursive=True)
                     if os.path.isfile(p) and p.lower().endswith((".zip",".sip"))]
         for arch in archives:
-            if arch.endswith(".extracted"):
-                continue
+            if arch.endswith(".extracted"): continue
             try:
-                target = os.path.join(os.path.dirname(arch),
-                                      os.path.splitext(os.path.basename(arch))[0] + "_extracted")
+                target = os.path.join(os.path.dirname(arch), os.path.splitext(os.path.basename(arch))[0] + "_extracted")
                 os.makedirs(target, exist_ok=True)
-                with zipfile.ZipFile(arch,"r") as zf:
-                    zf.extractall(target)
-                try:
-                    os.rename(arch, arch+".extracted")
+                with zipfile.ZipFile(arch,"r") as zf: zf.extractall(target)
+                try: os.rename(arch, arch+".extracted")
                 except Exception:
                     try: os.remove(arch)
                     except Exception: pass
@@ -216,49 +215,31 @@ def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
         dbx.files_download_to_file(local_path, remote_path)
     return local_path
 
-def resolve_selected_to_csvs(selected_paths, workdir):
-    csvs, seen = [], set()
-    for remote in selected_paths:
-        base = os.path.basename(remote)
-        name, ext = os.path.splitext(base)
-        if ext.lower() in (".zip", ".sip"):
-            pattern = os.path.join(workdir, f"{name}_extracted", "**", "*.csv")
-            for p in glob.glob(pattern, recursive=True):
-                if p not in seen:
-                    csvs.append(p); seen.add(p)
-        elif ext.lower() == ".csv":
-            p = os.path.join(workdir, base)
-            if os.path.isfile(p) and p not in seen:
-                csvs.append(p); seen.add(p)
-    return csvs
-
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
-    rows, failed_files = [], []
+    rows=[]
+    failed_files=[]
     total = max(1, len(csv_paths))
     if st_container is not None:
-        progress = st_container.progress(0); status_text = st_container.empty()
+        progress = st_container.progress(0)
+        status_text = st_container.empty()
     for i, cp in enumerate(sorted(csv_paths), start=1):
-        # robuste Leseroutine
-        try:
-            _ = pd.read_csv(cp, nrows=1)
-        except Exception:
-            failed_files.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
-            if st_container is not None:
-                status_text.text(f"Skipping (no CSV): {os.path.basename(cp)}")
-            continue
-
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
         if dt is None:
             failed_files.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel im Namen."})
             if st_container is not None:
-                status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
+                st.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Ungültiger Zeitstempel im Namen.")
             continue
-
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
-
-
-        alpha, beta = float(rel["alpha"].mean()), float(rel["beta"].mean())
-        theta, delta, gamma = float(rel["theta"].mean()), float(rel["delta"].mean()), float(rel["gamma"].mean())
+        rel = load_csv(proc_path)
+        if rel is None or rel.empty:
+            rel = load_csv(cp)
+        if rel is None or rel.empty:
+            failed_files.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten gefunden."})
+            if st_container is not None:
+                st.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Keine gültigen Bandspalten gefunden.")
+            continue
+        alpha, beta = float(rel["Alpha_TP9"].mean()), float(rel["Beta_TP9"].mean())
+        theta, delta, gamma = float(rel["Theta_TP9"].mean()), float(rel["Delta_TP9"].mean()), float(rel["Gamma_TP9"].mean())
         rows.append({
             "datetime": dt, "alpha":alpha,"beta":beta,"theta":theta,"delta":delta,"gamma":gamma,
             "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
@@ -269,24 +250,21 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     if st_container is not None:
         progress.empty(); status_text.empty()
     df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values("datetime").reset_index(drop=True)
-        df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
+    if not df.empty: df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
     return df, failed_files
 
-# ---------- UI: Datenquelle ----------
+# --------- UI: Quelle ---------
 st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
-
-selected_paths = []  # für Dropbox-Auswahl (remote Pfade)
+workdir = tempfile.mkdtemp(prefix="eeg_works_")
+selected_paths = []
 
 # Datei-Upload
 if mode == "Datei-Upload (ZIP)":
     up = st.file_uploader("ZIP-Datei hochladen (CSV/SIP enthalten)", type=["zip"])
     if up is not None:
         try:
-            with zipfile.ZipFile(io.BytesIO(up.read()),"r") as zf:
-                zf.extractall(workdir)
+            with zipfile.ZipFile(io.BytesIO(up.read()),"r") as zf: zf.extractall(workdir)
             recursively_extract_archives(workdir)
             st.success("ZIP entpackt.")
         except Exception as e:
@@ -336,7 +314,7 @@ elif mode == "SFTP (optional)":
 # Dropbox mit AgGrid
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
-        st.error("Dropbox SDK fehlt. requirements.txt: dropbox")
+        st.error("Dropbox SDK fehlt. `pip install dropbox`")
     else:
         token = st.secrets.get("dropbox",{}).get("access_token") if "dropbox" in st.secrets else os.getenv("DROPBOX_TOKEN")
         configured_path = st.secrets.get("dropbox",{}).get("path") if "dropbox" in st.secrets else ""
@@ -346,7 +324,8 @@ elif mode == "Dropbox":
         else:
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
-
+            
+            # Listing
             entries=[]
             try:
                 res = dbx.files_list_folder(api_path, recursive=False); entries = res.entries
@@ -356,11 +335,11 @@ elif mode == "Dropbox":
                 st.error(f"Dropbox ApiError: {getattr(e,'error_summary',str(e))}")
             except Exception as e:
                 st.error(f"Dropbox-Fehler: {e}")
-
             files = [e for e in entries if isinstance(e, FileMetadata)]
             files = [f for f in files if f.name.lower().endswith((".zip",".csv",".sip"))]
             files = sorted(files, key=lambda x: x.name.lower())
-
+            
+            # DataFrame für Anzeige: nur Beschreibung (Datum · Größe)
             rows=[]
             for f in files:
                 dt = parse_dt_from_path(f.path_display)
@@ -372,55 +351,22 @@ elif mode == "Dropbox":
                              "dt": dt_str, "size_kb": size_kb})
             df_files = pd.DataFrame(rows)
 
+            # --- FALLBACK-LÖSUNG (KEINE AgGrid-Bibliothek) ---
             selected_paths = []
-            try:
-                from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-                if df_files.empty:
-                    st.info("0 Datei(en) im Ordner.")
-                else:
-                    gb = GridOptionsBuilder.from_dataframe(df_files)
-                    gb.configure_column("description", header_name="Datum · Größe",
-                                        checkboxSelection=True, headerCheckboxSelection=True,
-                                        headerCheckboxSelectionFilteredOnly=True,
-                                        sortable=True, filter=True, resizable=True)
-                    for col in ["path_lower","path_display","dt","size_kb"]:
-                        gb.configure_column(col, hide=True)
-                    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-                    gb.configure_grid_options(
-                        rowSelection="multiple",
-                        suppressRowClickSelection=True,
-                        rowMultiSelectWithClick=True,
-                        pagination=True, paginationAutoPageSize=False, paginationPageSize=30,
-                        domLayout='normal'
-                    )
-                    grid = AgGrid(
-                        df_files[["description","path_lower","path_display","dt","size_kb"]],
-                        gridOptions=gb.build(),
-                        height=360,
-                        update_mode=GridUpdateMode.SELECTION_CHANGED,
-                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                        fit_columns_on_grid_load=True,
-                        enable_enterprise_modules=False,
-                        allow_unsafe_jscode=False,
-                        theme="streamlit"
-                    )
-                    selected = grid.get("selected_rows", [])
-                    selected_paths = [r["path_lower"] for r in selected] if selected else []
-            except Exception:
-                st.warning("AgGrid nicht verfügbar. Fallback auf einfache Checkbox-Liste.")
-                if df_files.empty:
-                    st.info("0 Datei(en) im Ordner.")
-                else:
-                    st.session_state.setdefault("fb_sel", set())
-                    for i,row in df_files.iterrows():
-                        key = f"fb_{i}"
-                        checked = st.checkbox(row["description"], key=key, value=(key in st.session_state["fb_sel"]))
-                        if checked: st.session_state["fb_sel"].add(key)
-                        else: st.session_state["fb_sel"].discard(key)
-                    for i,row in df_files.iterrows():
-                        if f"fb_{i}" in st.session_state["fb_sel"]:
-                            selected_paths.append(row["path_lower"])
+            if df_files.empty:
+                st.info("0 Datei(en) im Ordner.")
+            else:
+                st.session_state.setdefault("fb_sel", set())
+                for i, row in df_files.iterrows():
+                    key = f"fb_{i}"
+                    checked = st.checkbox(row["description"], key=key, value=(key in st.session_state["fb_sel"]))
+                    if checked: st.session_state["fb_sel"].add(key)
+                    else: st.session_state["fb_sel"].discard(key)
+                for i, row in df_files.iterrows():
+                    if f"fb_{i}" in st.session_state["fb_sel"]:
+                        selected_paths.append(row["path_lower"])
 
+            # Download-Action
             dl_col1, dl_col2 = st.columns([1,3])
             with dl_col1:
                 if st.button("Herunterladen (Auswahl)"):
@@ -437,8 +383,8 @@ elif mode == "Dropbox":
                         if downloaded:
                             recursively_extract_archives(workdir)
                             st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
-
-# ---------- Parameter / QC ----------
+            
+# --------- Parameter / QC (behalten, kompakt) ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
@@ -451,26 +397,26 @@ outlier_z = st.slider("Outlier z-Schwelle", 1.5, 5.0, 3.0, 0.5)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
 
-# ---------- CSV-Zusammenfassung ----------
+# --------- CSV-Suche im Arbeitsverzeichnis ---------
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir,"**","*"), recursive=True)
                  if os.path.isfile(p) and p.lower().endswith(".csv")]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
 
-# ---------- Auswertung ----------
+# ---------- Auswertung: jetzt mit der richtigen Dateiauswahl ---------
 if st.button("Auswertung starten"):
     recursively_extract_archives(workdir)
-
-    # Bevorzugt: ausgewählte Dropbox-Dateien → CSVs auflösen
-    selected_csvs = []
-    if mode == "Dropbox" and 'selected_paths' in locals() and selected_paths:
-        selected_csvs = resolve_selected_to_csvs(selected_paths, workdir)
-
-    # Fallback: alle CSVs im workdir
-    if not selected_csvs:
-        selected_csvs = [p for p in glob.glob(os.path.join(workdir,"**","*.csv"), recursive=True)]
-
+    
+    # Hier wird die Auswahl aus der Dropbox-Tabelle verarbeitet.
+    # Wenn im Dropbox-Modus Dateien ausgewählt wurden, werden nur diese analysiert.
+    if mode == "Dropbox" and selected_paths:
+        selected_csvs = [os.path.join(workdir, os.path.basename(path)) for path in selected_paths]
+    else:
+        # Andernfalls, oder wenn keine Dateien ausgewählt wurden, werden alle gefundenen CSVs verarbeitet.
+        selected_csvs = [p for p in glob.glob(os.path.join(workdir,"**","*"), recursive=True)
+                         if os.path.isfile(p) and p.lower().endswith(".csv")]
+        
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(selected_csvs)}")
 
     if not selected_csvs:
@@ -478,12 +424,11 @@ if st.button("Auswertung starten"):
     else:
         tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
         container = st.empty()
-        df, failed_files = build_session_table_from_list(
-            selected_csvs, tmpdir, fs=(fs if do_preproc else 0.0), st_container=container
-        )
+        df, failed_files = build_session_table_from_list(selected_csvs, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
         try: shutil.rmtree(tmpdir)
         except Exception: pass
 
+        # **Neue Logik:**
         if not df.empty:
             faa_list = []
             for cp in selected_csvs:
@@ -491,7 +436,7 @@ if st.button("Auswertung starten"):
                 if faa is not None:
                     faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
             faa_df = pd.DataFrame(faa_list)
-
+            
             if len(df)==1:
                 st.subheader("Einzel-Session")
                 st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
@@ -512,18 +457,9 @@ if st.button("Auswertung starten"):
             st.download_button("Summary CSV herunterladen",
                                data=df_out.to_csv(index=False).encode("utf-8"),
                                file_name="summary_indices.csv", mime="text/csv")
-
+            
+        # **Ausgabe der fehlgeschlagenen Dateien:**
         if failed_files:
-            st.subheader("Übersprungene Dateien")
+            st.subheader("Folgende Dateien wurden übersprungen:")
             for f in failed_files:
                 st.warning(f"**{f['source']}**: {f['reason']}")
-
-# optional: Arbeitsordner leeren
-with st.expander("Debug / Wartung", expanded=False):
-    if st.button("Arbeitsordner leeren"):
-        try:
-            shutil.rmtree(st.session_state["workdir"])
-        except Exception:
-            pass
-        st.session_state.pop("workdir", None)
-        st.success("Arbeitsordner geleert. Seite neu laden.")
