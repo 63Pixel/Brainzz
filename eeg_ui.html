@@ -338,8 +338,7 @@ function buildCsv(summary){
   const rows = summary.map(s=>[
     s.dt.toISOString(), s.date_str, s.delta, s.theta, s.alpha, s.beta, s.gamma, s.stress, s.relax, s.tod
   ]);
-  const csv = [headers.join(','), ...rows.map(r=>r.join(','))].join('
-');
+  const csv = [headers.join(','), ...rows.map(r=>r.join(','))].join('\n');
   const blob = new Blob([csv], {type:'text/csv'});
   const url = URL.createObjectURL(blob);
   const a = getId('downloadCsvBtn');
