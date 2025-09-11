@@ -462,7 +462,7 @@ elif mode == "Dropbox":
                         df_files[["description","path_display","path_lower","dt","size_kb"]],
                         gridOptions=gridOptions,
                         height=300,
-                        update_mode=GridUpdateMode.SELECTION_CHANGED,
+                        update_on=[GridUpdateMode.SELECTION_CHANGED],
                         data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
                         fit_columns_on_grid_load=True,
                         enable_enterprise_modules=False,
