@@ -388,75 +388,89 @@ elif mode == "SFTP (optional)":
                 st.error(f"SFTP-Fehler: {e}")
 
 # Dropbox: nur konfigurierter Ordner, keine Navigation
+# --- Dropbox: nur konfigurierter Ordner, Checkboxen, keine Navigation ---
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
-        st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
+        st.error("Dropbox SDK fehlt. In requirements.txt: dropbox")
     else:
         token = st.secrets.get("dropbox", {}).get("access_token") if "dropbox" in st.secrets else os.getenv("DROPBOX_TOKEN")
         configured_path = st.secrets.get("dropbox", {}).get("path") if "dropbox" in st.secrets else ""
-        if configured_path is None:
-            configured_path = ""
-        api_path = normalize_api_path(configured_path)
+        def normalize_api_path(p: str) -> str:
+            if p is None:
+                return ""
+            s = str(p).strip().replace("\\", "/")
+            if s in ("", "/"):
+                return ""
+            return s if s.startswith("/") else "/" + s
 
+        api_path = normalize_api_path(configured_path)
         if not token:
-            st.error("Dropbox-Token fehlt. st.secrets['dropbox']['access_token'] setzen oder DROPBOX_TOKEN.")
+            st.error("Dropbox-Token fehlt.")
         else:
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # Liste Dateien im Ordner (keine Rekursion, keine Navigation)
-            folders, files = list_folder(dbx, api_path)
+            # Listing nur dieses Ordners
+            files = []
+            try:
+                res = dbx.files_list_folder(api_path, recursive=False)
+                entries = res.entries
+                files = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
+            except dropbox.exceptions.AuthError:
+                st.error("AuthError: Scopes fehlen (files.metadata.read, files.content.read). Neues Token erzeugen.")
+                files = []
+            except dropbox.exceptions.ApiError as e:
+                st.error(f"Dropbox ApiError: {getattr(e, 'error_summary', e)}")
+                files = []
+            except Exception as e:
+                st.error(f"Dropbox-Fehler: {e}")
+                files = []
 
             # Nur ZIP/CSV/SIP anzeigen
-visible_files = [f for f in files if f.name.lower().endswith((".zip",".csv",".sip"))]
+            visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
 
-# Persistente Auswahl-States
-st.session_state.setdefault("db_files_map", [])
-st.session_state.setdefault("_select_all_applied", False)
-st.session_state.setdefault("select_all_master", False)
+            # Checkbox-Auswahl (mit 'Alle auswählen')
+            st.session_state.setdefault("db_files_map", [])
+            st.session_state.setdefault("_select_all_applied", False)
+            st.session_state.setdefault("select_all_master", False)
 
-if visible_files:
-    # stabile Reihenfolge
-    files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
-    st.session_state["db_files_map"] = files_map
+            if visible_files:
+                files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
+                st.session_state["db_files_map"] = files_map
 
-    # Master-Checkbox
-    st.checkbox("Alle auswählen", key="select_all_master")
+                st.checkbox("Alle auswählen", key="select_all_master")
 
-    # Auf Änderung der Master-Checkbox reagieren und auf Einzel-Checkboxen anwenden
-    if st.session_state["select_all_master"] != st.session_state["_select_all_applied"]:
-        new_state = st.session_state["select_all_master"]
-        # alle Einzel-Checkboxen auf new_state setzen
-        for i in range(len(files_map)):
-            st.session_state[f"chk_{i}"] = new_state
-        st.session_state["_select_all_applied"] = new_state
+                if st.session_state["select_all_master"] != st.session_state["_select_all_applied"]:
+                    new_state = st.session_state["select_all_master"]
+                    for i in range(len(files_map)):
+                        st.session_state[f"chk_{i}"] = new_state
+                    st.session_state["_select_all_applied"] = new_state
 
-    # Einzel-Checkboxen rendern
-    selected_pairs = []
-    for i, (disp, remote) in enumerate(files_map):
-        key = f"chk_{i}"
-        checked = st.session_state.get(key, False)
-        st.session_state[key] = st.checkbox(disp, value=checked, key=key)
-        if st.session_state[key]:
-            selected_pairs.append((disp, remote))
+                selected_pairs = []
+                for i, (disp, remote) in enumerate(files_map):
+                    key = f"chk_{i}"
+                    val = st.session_state.get(key, False)
+                    st.session_state[key] = st.checkbox(disp, value=val, key=key)
+                    if st.session_state[key]:
+                        selected_pairs.append((disp, remote))
 
-    # Download-Button
-    if st.button("Herunterladen ausgewählter Dateien"):
-        if not selected_pairs:
-            st.warning("Keine Datei ausgewählt.")
-        else:
-            downloaded = []
-            for disp, remote in selected_pairs:
-                try:
-                    lp = download_dropbox_file(token, remote, workdir)
-                    downloaded.append(lp)
-                except Exception as e:
-                    st.error(f"Download fehlgeschlagen: {disp} — {e}")
-            if downloaded:
-                recursively_extract_archives(workdir)
-                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
-else:
-    st.info("0 Datei(en) im Ordner. Die App listet nur direkte Einträge (keine Unterordner).")
+                if st.button("Herunterladen ausgewählter Dateien"):
+                    if not selected_pairs:
+                        st.warning("Keine Datei ausgewählt.")
+                    else:
+                        downloaded = []
+                        for disp, remote in selected_pairs:
+                            try:
+                                lp = download_dropbox_file(token, remote, workdir)
+                                downloaded.append(lp)
+                            except Exception as e:
+                                st.error(f"Download fehlgeschlagen: {disp} — {e}")
+                        if downloaded:
+                            recursively_extract_archives(workdir)
+                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
+            else:
+                st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+
 
 
 # ---------- Parameter / QC ----------
