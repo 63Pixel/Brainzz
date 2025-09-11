@@ -387,7 +387,7 @@ elif mode == "SFTP (optional)":
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
-# ---------------- Dropbox: kein Navigation, Checkbox-Auswahl (ersetzen) ----------------
+# ---------------- Dropbox: Kachel-Grid, Pagination, Checkboxen (ersetze bisherigen Dropbox-Block) ----------------
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
         st.error("Dropbox SDK fehlt. Füge 'dropbox' zu requirements.txt hinzu.")
@@ -397,8 +397,7 @@ elif mode == "Dropbox":
         if configured_path is None:
             configured_path = ""
 
-        # kleine Normalisierung ('' = app-root, sonst mit führendem '/')
-        def _normalize(p):
+        def _normalize(p: str) -> str:
             if p is None:
                 return ""
             s = str(p).strip().replace("\\", "/")
@@ -414,13 +413,13 @@ elif mode == "Dropbox":
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # Listing des konfigurierten Ordners (immer ausführen, damit 'files' definiert ist)
+            # list current folder (non-recursive)
             entries = []
             try:
                 res = dbx.files_list_folder(api_path, recursive=False)
                 entries = res.entries
             except dropbox.exceptions.AuthError:
-                st.error("AuthError: Token hat nicht die nötigen Scopes (files.metadata.read, files.content.read). Neues Token erzeugen.")
+                st.error("AuthError: Token ohne nötige Scopes. Neues Token erzeugen.")
                 entries = []
             except dropbox.exceptions.ApiError as e:
                 try:
@@ -435,60 +434,130 @@ elif mode == "Dropbox":
                 st.error(f"Dropbox-Fehler: {e}")
                 entries = []
 
-            # Sichere Definition von 'files'
-            files = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
+            files_all = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
+            visible_files = [f for f in files_all if f.name.lower().endswith((".zip", ".csv", ".sip"))]
+            # stable order
+            visible_files = sorted(visible_files, key=lambda x: x.name.lower())
 
-            # Sichtbare Dateien (nur ZIP/CSV/SIP)
-            visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
+            # pagination & layout settings (user can change columns/page size)
+            cols_opts = [2,3,4]
+            cols_n = st.selectbox("Spalten pro Zeile", options=cols_opts, index=1, help="Wie viele Kacheln pro Zeile")
+            per_page = st.selectbox("Einträge pro Seite", options=[12,24,36,48], index=1)
 
-            # Persistent keys vorbereiten
-            st.session_state.setdefault("db_files_map", [])
-            st.session_state.setdefault("select_all_master", False)
+            total = len(visible_files)
+            total_pages = max(1, (total + per_page - 1) // per_page)
+            st.session_state.setdefault("eeg_page", 1)
+            page = st.session_state["eeg_page"]
 
-            if visible_files:
-                # stabile Reihenfolge
-                files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
-                st.session_state["db_files_map"] = files_map
+            # navigation
+            nav_cols = st.columns([1,1,6])
+            with nav_cols[0]:
+                if st.button("‹ vorherige") and page > 1:
+                    st.session_state["eeg_page"] = page - 1
+                    st.experimental_rerun()
+            with nav_cols[1]:
+                if st.button("nächste ›") and page < total_pages:
+                    st.session_state["eeg_page"] = page + 1
+                    st.experimental_rerun()
+            with nav_cols[2]:
+                st.markdown(f"Seite **{page} / {total_pages}**  •  Gesamtdateien: **{total}**")
 
-                # Callback für Master-Checkbox
-                def _apply_select_all():
-                    val = st.session_state.get("select_all_master", False)
-                    for i in range(len(files_map)):
-                        st.session_state[f"chk_{i}"] = val
+            # build global files map in session for index lookup
+            files_map_all = [(f.path_display, f.path_lower, f.size if hasattr(f,'size') else None) for f in visible_files]
+            st.session_state["eeg_files_map_all"] = files_map_all
 
-                st.checkbox("Alle auswählen", key="select_all_master", on_change=_apply_select_all)
+            # compute slice for current page
+            start = (page - 1) * per_page
+            end = min(start + per_page, total)
+            page_files = files_map_all[start:end]
 
-                # Einzel-Checkboxen rendern (Streamlit pflegt den State)
-                for i, (disp, _remote) in enumerate(files_map):
-                    key = f"chk_{i}"
-                    # initial value aus session_state (falls schon gesetzt), ansonsten False
-                    init_val = st.session_state.get(key, False)
-                    st.checkbox(disp, key=key, value=init_val)
+            # master-checkbox per page
+            st.session_state.setdefault(f"eeg_select_page_{page}", False)
+            def _apply_select_page():
+                val = st.session_state.get(f"eeg_select_page_{page}", False)
+                for gi in range(start, end):
+                    st.session_state[f"eeg_chk_{gi}"] = val
+            st.checkbox(f"Alle auf Seite {page} auswählen", key=f"eeg_select_page_{page}", on_change=_apply_select_page)
 
-                # Auswahl einsammeln
+            # render grid of cards
+            if page_files:
+                rows = (len(page_files) + cols_n - 1) // cols_n
+                idx = 0
+                for r in range(rows):
+                    cols = st.columns(cols_n)
+                    for c in cols:
+                        if idx >= len(page_files):
+                            # empty column
+                            with c:
+                                st.write("")
+                            idx += 1
+                            continue
+                        disp, remote, size = page_files[idx]
+                        global_index = start + idx
+                        key = f"eeg_chk_{global_index}"
+                        # ensure key exists with default False
+                        if key not in st.session_state:
+                            st.session_state[key] = False
+                        with c:
+                            # compact card
+                            checked = st.checkbox("", key=key, value=st.session_state.get(key, False))
+                            # show filename truncated in one line
+                            short = disp if len(disp) <= 40 else "…" + disp[-37:]
+                            st.markdown(f"**{short}**")
+                            meta = []
+                            if size is not None:
+                                meta.append(f"{int(size/1024)} KB")
+                            # try to get approximate date from name
+                            dt = parse_dt_from_path(disp)
+                            if dt is None:
+                                # if not, show nothing or placeholder
+                                pass
+                            else:
+                                meta.append(dt.strftime("%d-%m-%y %H:%M"))
+                            if meta:
+                                st.caption(" · ".join(meta))
+                            idx += 1
+
+                # collect selected global indices
                 selected_pairs = []
-                for i, (disp, remote) in enumerate(files_map):
-                    if st.session_state.get(f"chk_{i}", False):
+                for gi, (disp, remote, _) in enumerate(files_map_all):
+                    if st.session_state.get(f"eeg_chk_{gi}", False):
                         selected_pairs.append((disp, remote))
 
-                if st.button("Herunterladen ausgewählter Dateien"):
-                    if not selected_pairs:
-                        st.warning("Keine Datei ausgewählt.")
-                    else:
-                        downloaded = []
-                        for disp, remote in selected_pairs:
-                            try:
-                                lp = download_dropbox_file(token, remote, workdir)
-                                downloaded.append(lp)
-                            except Exception as e:
-                                st.error(f"Download fehlgeschlagen: {disp} — {e}")
-                        if downloaded:
-                            recursively_extract_archives(workdir)
-                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
+                # sticky-like action bar (below grid)
+                st.markdown("---")
+                act_cols = st.columns([2,1,1,1,1])
+                with act_cols[0]:
+                    st.markdown(f"**Ausgewählt: {len(selected_pairs)}**")
+                with act_cols[1]:
+                    if st.button("Herunterladen"):
+                        if not selected_pairs:
+                            st.warning("Keine Datei ausgewählt.")
+                        else:
+                            downloaded = []
+                            for disp, remote in selected_pairs:
+                                try:
+                                    lp = download_dropbox_file(token, remote, workdir)
+                                    downloaded.append(lp)
+                                except Exception as e:
+                                    st.error(f"Download fehlgeschlagen: {disp} — {e}")
+                            if downloaded:
+                                recursively_extract_archives(workdir)
+                                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
+                with act_cols[2]:
+                    if st.button("Alle abwählen"):
+                        for gi in range(len(files_map_all)):
+                            st.session_state[f"eeg_chk_{gi}"] = False
+                with act_cols[3]:
+                    if st.button("Auswahl invertieren"):
+                        for gi in range(len(files_map_all)):
+                            st.session_state[f"eeg_chk_{gi}"] = not st.session_state.get(f"eeg_chk_{gi}", False)
+                with act_cols[4]:
+                    # quick jump: clear page master so UI updates
+                    if st.button("Aktualisieren"):
+                        st.experimental_rerun()
             else:
                 st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
-
-
 
 
 
