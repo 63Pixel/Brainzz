@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App
-- Dropbox: Auto-Lesen von st.secrets (access_token + path)
-- "Ordner öffnen" zeigt Dateiliste; Mehrfachauswahl möglich
-- "Herunterladen ausgewählter Dateien" lädt ausgewählte Dateien in das workdir
-- Keine Token/Path Eingabefelder mehr im UI
+EEG-Auswertung Streamlit App (gepatcht)
+- Robuste Dropbox-Navigation und Pfad-Probing
+- Nutzt st.secrets['dropbox']['access_token'] und st.secrets['dropbox']['path'] (leer für App-root)
+- Bei not_found: fällt automatisch auf App-root zurück und ermöglicht interaktive Navigation
+- Entfernt Token/Path-Eingaben im UI
+Speichere als app_streamlit.py und starte mit `streamlit run app_streamlit.py`.
 """
+
 import os
 import io
 import zipfile
@@ -18,9 +20,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
-from ftplib import FTP
 import plotly.express as px
 import plotly.graph_objects as go
+from ftplib import FTP
 
 # optional libs
 try:
@@ -35,52 +37,32 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# Dropbox SDK (optional)
+# Dropbox SDK
 try:
     import dropbox
     from dropbox.files import FileMetadata, FolderMetadata
+    from dropbox.exceptions import ApiError, AuthError
     HAS_DROPBOX = True
 except Exception:
     HAS_DROPBOX = False
 
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 
-# ---------------- Styling (edit hex values here) ----------------
+# ---------------- Styling ----------------
 st.markdown("""
 <style>
-.badge{display:inline-block;padding:4px 8px;border-radius:8px;color:#fff;font-size:12px;margin-right:8px}
-.badge-recent{background:#ff8c00}
-.badge-newest{background:#28a745}
-.badge-both{background:#6f42c1}
-.session-row{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
-:root{
-  --expander-bg: #e9ecef;
-  --expander-text: #0b3d91;
-  --expander-open-bg: #28a745;
-  --expander-open-text: #ffffff;
-}
-div.stExpander > div[data-testid="stExpander"] > details > summary,
-details > summary {
-  background: var(--expander-bg) !important;
-  color: var(--expander-text) !important;
-  padding: 8px 12px !important;
-  border-radius: 8px !important;
-  margin-bottom: 6px !important;
-  cursor: pointer;
-}
-details[open] > summary,
-div.stExpander[open] > summary {
-  background: var(--expander-open-bg) !important;
-  color: var(--expander-open-text) !important;
-}
+:root{ --expander-bg: #e9ecef; --expander-text: #0b3d91; --expander-open-bg:#28a745; --expander-open-text:#fff }
+details > summary{ background:var(--expander-bg)!important; color:var(--expander-text)!important; padding:8px 12px; border-radius:8px; cursor:pointer }
+details[open] > summary{ background:var(--expander-open-bg)!important; color:var(--expander-open-text)!important }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("EEG-Auswertung")
-st.caption("Upload/FTP/SFTP/Dropbox → Ordner öffnen → Dateien wählen → Auswertung starten")
+st.caption("ZIP/FTP/SFTP/Dropbox → Dateien wählen → Auswertung starten")
 
-# ---------------- Filename timestamp parsing ----------------
+# ---------------- helpers ----------------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
+
 def parse_dt_from_path(path):
     m = PAT.search(path)
     if not m:
@@ -90,18 +72,20 @@ def parse_dt_from_path(path):
     except Exception:
         return None
 
-# ---------------- Signal helpers (best-effort) ----------------
+# signal helpers (best-effort)
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
     if not HAS_SCIPY:
         return x
     b,a = iirnotch(f0, Q, fs)
     return filtfilt(b,a,x)
+
 def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     if not HAS_SCIPY:
         return x
     nyq = fs/2.0
     b,a = butter(order, [low/nyq, high/nyq], btype='band')
     return filtfilt(b,a,x)
+
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -121,9 +105,10 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
             proc[c] = sig
         except Exception:
             continue
-    out_path = os.path.join(out_tmp_dir, os.path.basename(csv_path).replace(".csv","_proc.csv"))
+    out_path = os.path.join(out_tmp_dir, os.path.basename(csv_path).replace('.csv','_proc.csv'))
     proc.to_csv(out_path, index=False)
     return out_path, True
+
 def load_session_relatives(csv_path):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -141,7 +126,7 @@ def load_session_relatives(csv_path):
     sums = {}
     for b in bands:
         try:
-            sums[b.lower()] = df[band_cols[b]].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+            sums[b.lower()] = df[band_cols[b]].apply(pd.to_numeric, errors='coerce').sum(axis=1)
         except Exception:
             return None
     rel = pd.DataFrame(sums).replace([np.inf,-np.inf], np.nan).dropna()
@@ -149,74 +134,71 @@ def load_session_relatives(csv_path):
     rel = rel.div(total, axis=0).dropna()
     return rel
 
-# ---------------- Plot helpers ----------------
+# plotting
 def plot_single_session_interactive(df):
-    vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
-            "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
-            "Alpha": df["alpha"].iloc[0], "Beta": df["beta"].iloc[0],
-            "Gamma": df["gamma"].iloc[0]}
-    data = pd.DataFrame({"Metrik": list(vals.keys()), "Wert": list(vals.values())})
-    fig = px.bar(data, x="Metrik", y="Wert", color="Metrik", text="Wert", height=360)
-    fig.update_traces(texttemplate="%{text:.2f}", textposition="outside", showlegend=False)
+    vals = {"Stress": df['stress'].iloc[0], "Entspannung": df['relax'].iloc[0],
+            "Delta": df['delta'].iloc[0], "Theta": df['theta'].iloc[0],
+            "Alpha": df['alpha'].iloc[0], "Beta": df['beta'].iloc[0],
+            "Gamma": df['gamma'].iloc[0]}
+    data = pd.DataFrame({'Metrik': list(vals.keys()), 'Wert': list(vals.values())})
+    fig = px.bar(data, x='Metrik', y='Wert', color='Metrik', text='Wert', height=360)
+    fig.update_traces(texttemplate='%{text:.2f}', textposition='outside', showlegend=False)
     fig.update_layout(margin=dict(l=20,r=20,t=40,b=20))
     return fig
 
 def plot_stress_relax(df, smooth=5, outlier_z=3.0):
     df = df.copy()
-    df["stress_z"] = (df["stress"] - df["stress"].mean()) / (df["stress"].std(ddof=0) + 1e-9)
-    df["relax_z"]  = (df["relax"]  - df["relax"].mean())  / (df["relax"].std(ddof=0)  + 1e-9)
-    df["stress_trend"] = df["stress"].rolling(window=smooth, center=True, min_periods=1).mean()
-    df["relax_trend"]  = df["relax"].rolling(window=smooth, center=True, min_periods=1).mean()
-    long_df = df.melt(id_vars=["date_str"], value_vars=["stress","relax","stress_trend","relax_trend"],
-                      var_name="Metrik", value_name="Wert")
-    fig = px.line(long_df, x="date_str", y="Wert", color="Metrik", markers=True, height=360)
-    fig.update_layout(xaxis=dict(type="category"))
-    outl = df[(np.abs(df["stress_z"])>outlier_z) | (np.abs(df["relax_z"])>outlier_z)]
+    df['stress_z'] = (df['stress'] - df['stress'].mean()) / (df['stress'].std(ddof=0) + 1e-9)
+    df['relax_z']  = (df['relax']  - df['relax'].mean())  / (df['relax'].std(ddof=0)  + 1e-9)
+    df['stress_trend'] = df['stress'].rolling(window=smooth, center=True, min_periods=1).mean()
+    df['relax_trend']  = df['relax'].rolling(window=smooth, center=True, min_periods=1).mean()
+    long_df = df.melt(id_vars=['date_str'], value_vars=['stress','relax','stress_trend','relax_trend'],
+                      var_name='Metrik', value_name='Wert')
+    fig = px.line(long_df, x='date_str', y='Wert', color='Metrik', markers=True, height=360)
+    fig.update_layout(xaxis=dict(type='category'))
+    outl = df[(np.abs(df['stress_z'])>outlier_z) | (np.abs(df['relax_z'])>outlier_z)]
     if not outl.empty:
         for idx, row in outl.iterrows():
-            fig.add_trace(go.Scatter(x=[row["date_str"]], y=[row["stress"]],
-                                     mode="markers", marker_symbol="x", marker=dict(color="red", size=10),
-                                     name="Outlier (Stress)", showlegend=False))
-            fig.add_trace(go.Scatter(x=[row["date_str"]], y=[row["relax"]],
-                                     mode="markers", marker_symbol="x", marker=dict(color="green", size=10),
-                                     name="Outlier (Relax)", showlegend=False))
-    fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
+            fig.add_trace(go.Scatter(x=[row['date_str']], y=[row['stress']], mode='markers',
+                                     marker_symbol='x', marker=dict(color='red', size=10), name='Outlier (Stress)', showlegend=False))
+            fig.add_trace(go.Scatter(x=[row['date_str']], y=[row['relax']], mode='markers',
+                                     marker_symbol='x', marker=dict(color='green', size=10), name='Outlier (Relax)', showlegend=False))
+    fig.update_traces(hovertemplate='Datum: %{x}<br>%{y:.3f}')
     return fig
 
 def plot_bands(df, smooth=5):
     d = df.copy()
-    d["stresswave"] = d["beta"] + d["gamma"]
-    d["relaxwave"]  = d["alpha"] + d["theta"]
-    for c in ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]:
+    d['stresswave'] = d['beta'] + d['gamma']
+    d['relaxwave']  = d['alpha'] + d['theta']
+    for c in ['delta','theta','alpha','beta','gamma','stresswave','relaxwave']:
         d[f"{c}_trend"] = d[c].rolling(window=smooth, center=True, min_periods=1).mean()
-    cols = ["delta_trend","theta_trend","alpha_trend","beta_trend","gamma_trend","stresswave_trend","relaxwave_trend"]
-    long_df = d.melt(id_vars=["date_str"], value_vars=cols, var_name="Band", value_name="Wert")
-    mapping = {"delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta",
-               "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)",
-               "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
-    long_df["Band"] = long_df["Band"].map(mapping)
-    fig = px.line(long_df, x="date_str", y="Wert", color="Band", markers=True, height=380)
-    fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0,1]))
-    fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
+    cols = ['delta_trend','theta_trend','alpha_trend','beta_trend','gamma_trend','stresswave_trend','relaxwave_trend']
+    long_df = d.melt(id_vars=['date_str'], value_vars=cols, var_name='Band', value_name='Wert')
+    mapping = { 'delta_trend':'Delta','theta_trend':'Theta','alpha_trend':'Alpha','beta_trend':'Beta','gamma_trend':'Gamma',
+               'stresswave_trend':'Stress-Welle (Beta+Gamma)','relaxwave_trend':'Entspannungs-Welle (Alpha+Theta)'}
+    long_df['Band'] = long_df['Band'].map(mapping)
+    fig = px.line(long_df, x='date_str', y='Wert', color='Band', markers=True, height=380)
+    fig.update_layout(xaxis=dict(type='category'), yaxis=dict(range=[0,1]))
+    fig.update_traces(hovertemplate='Datum: %{x}<br>%{y:.3f}')
     return fig
 
-# ---------------- Recursive extraction ----------------
+# recursive extraction
 def recursively_extract_archives(root_dir):
     changed = True
     while changed:
         changed = False
-        archives = [p for p in glob.glob(os.path.join(root_dir, "**", "*"), recursive=True)
+        archives = [p for p in glob.glob(os.path.join(root_dir, '**', '*'), recursive=True)
                     if os.path.isfile(p) and p.lower().endswith(('.zip', '.sip'))]
         for arch in archives:
             if arch.endswith('.extracted'):
                 continue
             try:
-                target = os.path.join(os.path.dirname(arch), os.path.splitext(os.path.basename(arch))[0] + "_extracted")
+                target = os.path.join(os.path.dirname(arch), os.path.splitext(os.path.basename(arch))[0] + '_extracted')
                 os.makedirs(target, exist_ok=True)
-                with zipfile.ZipFile(arch, "r") as zf:
+                with zipfile.ZipFile(arch, 'r') as zf:
                     zf.extractall(target)
                 try:
-                    os.rename(arch, arch + ".extracted")
+                    os.rename(arch, arch + '.extracted')
                 except Exception:
                     try:
                         os.remove(arch)
@@ -228,38 +210,19 @@ def recursively_extract_archives(root_dir):
             except Exception:
                 continue
 
-# ---------------- Dropbox helpers ----------------
-def list_dropbox_folder(dbx_token: str, dropbox_path: str):
-    if not HAS_DROPBOX:
-        raise RuntimeError("Dropbox SDK nicht installiert.")
-    dbx = dropbox.Dropbox(dbx_token, timeout=300)
-    try:
-        res = dbx.files_list_folder(dropbox_path, recursive=False)
-    except Exception as e:
-        raise
-    entries = res.entries[:]
-    while res.has_more:
-        res = dbx.files_list_folder_continue(res.cursor)
-        entries.extend(res.entries)
-    return entries
-
+# download single file helper
 def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
     dbx = dropbox.Dropbox(dbx_token, timeout=300)
     local_path = os.path.join(local_dir, os.path.basename(remote_path))
-    # overwrite allowed
     try:
         md, res = dbx.files_download(remote_path)
-        with open(local_path, "wb") as f:
+        with open(local_path, 'wb') as f:
             f.write(res.content)
     except Exception:
-        # fallback chunked
-        try:
-            dbx.files_download_to_file(local_path, remote_path)
-        except Exception as e:
-            raise
+        dbx.files_download_to_file(local_path, remote_path)
     return local_path
 
-# ---------------- build session table ----------------
+# build session table
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
     rows = []
     total = max(1, len(csv_paths))
@@ -280,24 +243,24 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
                 if st_container is not None:
                     status_text.text(f"Skipping (no band columns): {os.path.basename(cp)}")
                 continue
-        alpha = float(rel["alpha"].mean())
-        beta  = float(rel["beta"].mean())
-        theta = float(rel["theta"].mean())
-        delta = float(rel["delta"].mean())
-        gamma = float(rel["gamma"].mean())
+        alpha = float(rel['alpha'].mean())
+        beta  = float(rel['beta'].mean())
+        theta = float(rel['theta'].mean())
+        delta = float(rel['delta'].mean())
+        gamma = float(rel['gamma'].mean())
         stress = float(beta/(alpha+1e-9))
         relax  = float(alpha/(beta+1e-9))
         rows.append({
-            "datetime": dt,
-            "alpha": alpha,
-            "beta": beta,
-            "theta": theta,
-            "delta": delta,
-            "gamma": gamma,
-            "stress": stress,
-            "relax": relax,
-            "proc": did_proc,
-            "source": os.path.basename(cp)
+            'datetime': dt,
+            'alpha': alpha,
+            'beta': beta,
+            'theta': theta,
+            'delta': delta,
+            'gamma': gamma,
+            'stress': stress,
+            'relax': relax,
+            'proc': did_proc,
+            'source': os.path.basename(cp)
         })
         if st_container is not None:
             progress.progress(int(i/total*100))
@@ -305,66 +268,66 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     if st_container is not None:
         progress.empty()
         status_text.empty()
-    df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
+    df = pd.DataFrame(rows).dropna().sort_values('datetime').reset_index(drop=True)
     if not df.empty:
-        df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
+        df['date_str'] = df['datetime'].dt.strftime('%d-%m-%y %H:%M')
     return df
 
 # ---------------- UI ----------------
-st.subheader("1) Datenquelle wählen")
-mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
+st.subheader('1) Datenquelle wählen')
+mode = st.radio('Quelle', ['Datei-Upload (ZIP)', 'FTP-Download', 'SFTP (optional)', 'Dropbox'], horizontal=True)
 
-workdir = tempfile.mkdtemp(prefix="eeg_works_")
+workdir = tempfile.mkdtemp(prefix='eeg_works_')
 
-# --- File upload ---
-if mode == "Datei-Upload (ZIP)":
-    up = st.file_uploader("ZIP-Datei hochladen (Paket mit CSVs/SIPs)", type=["zip"])
+# File upload
+if mode == 'Datei-Upload (ZIP)':
+    up = st.file_uploader('ZIP-Datei hochladen (Paket mit CSVs/SIPs)', type=['zip'])
     if up is not None:
         zbytes = up.read()
         try:
-            with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
+            with zipfile.ZipFile(io.BytesIO(zbytes), 'r') as zf:
                 zf.extractall(workdir)
             recursively_extract_archives(workdir)
-            st.success("ZIP entpackt und verschachtelte Archive extrahiert.")
+            st.success('ZIP entpackt und verschachtelte Archive extrahiert.')
         except Exception as e:
-            st.error(f"ZIP konnte nicht entpackt werden: {e}")
+            st.error(f'ZIP konnte nicht entpackt werden: {e}')
 
-# --- FTP ---
-elif mode == "FTP-Download":
-    st.info("FTP unverschlüsselt. Für SFTP wähle SFTP-Option.")
-    host = st.text_input("FTP-Host", value="ftp.example.com")
-    user = st.text_input("Benutzer", value="anonymous")
-    pwd  = st.text_input("Passwort", value="", type="password")
-    remote_dir = st.text_input("Remote-Pfad", value="/")
-    pattern = st.text_input("Dateimuster (z. B. .zip)", value=".zip")
-    if st.button("Vom FTP laden"):
+# FTP
+elif mode == 'FTP-Download':
+    st.info('FTP unverschlüsselt. Für SFTP wähle SFTP-Option.')
+    host = st.text_input('FTP-Host', value='ftp.example.com')
+    user = st.text_input('Benutzer', value='anonymous')
+    pwd  = st.text_input('Passwort', value='', type='password')
+    remote_dir = st.text_input('Remote-Pfad', value='/')
+    pattern = st.text_input('Dateimuster (z. B. .zip)', value='.zip')
+    if st.button('Vom FTP laden'):
         try:
             ftp = FTP(host); ftp.login(user=user, passwd=pwd); ftp.cwd(remote_dir)
             names = ftp.nlst()
             targets = [n for n in names if pattern in n]
             if not targets:
-                st.warning("Keine passenden Dateien auf FTP gefunden.")
+                st.warning('Keine passenden Dateien auf FTP gefunden.')
             for name in targets:
                 loc = os.path.join(workdir, name)
-                with open(loc, "wb") as f:
-                    ftp.retrbinary("RETR " + name, f.write)
+                with open(loc, 'wb') as f:
+                    ftp.retrbinary('RETR ' + name, f.write)
             recursively_extract_archives(workdir)
             st.success(f"{len(targets)} Datei(en) geladen und Archive extrahiert.")
             ftp.quit()
         except Exception as e:
-            st.error(f"FTP-Fehler: {e}")
+            st.error(f'FTP-Fehler: {e}')
 
-# --- SFTP ---
-elif mode == "SFTP (optional)":
+# SFTP
+elif mode == 'SFTP (optional)':
     if not HAS_PARAMIKO:
-        st.error("Paramiko nicht installiert. SFTP nicht verfügbar.")
+        st.error('Paramiko nicht installiert. SFTP nicht verfügbar.')
     else:
-        host = st.text_input("SFTP-Host", value="sftp.example.com")
-        user = st.text_input("Benutzer", value="user")
-        pwd  = st.text_input("Passwort", value="", type="password")
-        remote_dir = st.text_input("Remote-Pfad", value="/")
-        pattern = st.text_input("Dateimuster (z. B. .zip)", value=".zip")
-        if st.button("Vom SFTP laden"):
+        host = st.text_input('SFTP-Host', value='sftp.example.com')
+        user = st.text_input('Benutzer', value='user')
+        pwd  = st.text_input('Passwort', value='', type='password')
+        remote_dir = st.text_input('Remote-Pfad', value='/')
+        pattern = st.text_input('Dateimuster (z. B. .zip)', value='.zip')
+        if st.button('Vom SFTP laden'):
             try:
                 transport = paramiko.Transport((host, 22))
                 transport.connect(username=user, password=pwd)
@@ -372,7 +335,7 @@ elif mode == "SFTP (optional)":
                 files = sftp.listdir(remote_dir)
                 targets = [f for f in files if pattern in f]
                 if not targets:
-                    st.warning("Keine passenden Dateien auf SFTP gefunden.")
+                    st.warning('Keine passenden Dateien auf SFTP gefunden.')
                 for name in targets:
                     remotepath = os.path.join(remote_dir, name)
                     localpath = os.path.join(workdir, name)
@@ -381,149 +344,185 @@ elif mode == "SFTP (optional)":
                 recursively_extract_archives(workdir)
                 st.success(f"{len(targets)} Datei(en) geladen via SFTP und Archive extrahiert.")
             except Exception as e:
-                st.error(f"SFTP-Fehler: {e}")
+                st.error(f'SFTP-Fehler: {e}')
 
-# --- Dropbox (auto token/path from st.secrets) ---
-elif mode == "Dropbox":
+# Dropbox (gepatcht): Auto-token/path aus st.secrets, robustes probing + Navigation
+elif mode == 'Dropbox':
     if not HAS_DROPBOX:
         st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
     else:
-        # automatic token/path from st.secrets (no UI inputs)
-        token = None
-        path = "/"
-        if "dropbox" in st.secrets:
-            token = st.secrets["dropbox"].get("access_token")
-            path = st.secrets["dropbox"].get("path", path)
-        if not token:
-            # fallback to env
-            token = os.getenv("DROPBOX_TOKEN", None)
+        token = st.secrets.get('dropbox', {}).get('access_token') if 'dropbox' in st.secrets else os.getenv('DROPBOX_TOKEN')
+        configured_path = st.secrets.get('dropbox', {}).get('path') if 'dropbox' in st.secrets else None
+        if configured_path is None:
+            configured_path = ''  # default to app-root behavior
 
         if not token:
-            st.error("Dropbox-Token nicht gefunden. Lege access_token in st.secrets['dropbox'] oder DROPBOX_TOKEN als Env an.")
+            st.error('Dropbox-Token nicht gefunden. Lege access_token in st.secrets oder DROPBOX_TOKEN als Env an.')
         else:
-            st.markdown(f"**Dropbox-Ordner (konfiguriert):** `{path}`")
-            if st.button("Ordner öffnen"):
-                try:
-                    entries = list_dropbox_folder(token, path)
-                    # build mapping display -> remote path
-                    files_only = [e for e in entries if isinstance(e, FileMetadata)]
-                    # store mapping in session_state
-                    st.session_state["db_files_map"] = {e.path_display: e.path_lower for e in files_only}
-                    st.success(f"{len(files_only)} Datei(en) gefunden.")
-                except Exception as e:
-                    st.error(f"Ordner-Liste fehlgeschlagen: {e}")
+            st.markdown(f"**Dropbox-Ordner (konfiguriert):** `{configured_path if configured_path!='' else '(app-root)'}`")
 
-            if "db_files_map" in st.session_state and st.session_state["db_files_map"]:
-                files_map = st.session_state["db_files_map"]
-                options = list(files_map.keys())
-                selected = st.multiselect("Wähle eine oder mehrere Dateien zum Herunterladen", options, default=[])
-                if st.checkbox("Alle auswählen"):
-                    selected = options
-                if selected:
-                    if st.button("Herunterladen ausgewählter Dateien"):
-                        downloaded = []
-                        with st.spinner("Lade ausgewählte Dateien herunter..."):
-                            for disp in selected:
-                                remote = files_map[disp]
-                                try:
-                                    lp = download_dropbox_file(token, remote, workdir)
-                                    downloaded.append(lp)
-                                except Exception as e:
-                                    st.error(f"Download fehlgeschlagen: {disp}  —  {e}")
-                        if downloaded:
-                            recursively_extract_archives(workdir)
-                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und Archive extrahiert.")
-                        else:
-                            st.warning("Keine Dateien erfolgreich heruntergeladen.")
+            # normalize: user might have set '/' meaning app-root -> convert later to '' for API
+            def normalize_for_api(p):
+                if p is None:
+                    return ''
+                if p == '/':
+                    return ''
+                return p
+
+            dbx = dropbox.Dropbox(token, timeout=300)
+
+            # probe_candidates tries several possible API paths until one works
+            def probe_candidates(dbx, configured):
+                candidates = []
+                # prefer what user configured
+                candidates.append(configured)
+                # if configured startswith '/', try without leading slash
+                if configured and configured.startswith('/'):
+                    candidates.append(configured.lstrip('/'))
+                # try app-root (empty string) and full-root
+                candidates.append('')
+                candidates.append('/')
+                # also try last path segment only
+                if configured and '/' in configured.strip('/'):
+                    parts = configured.strip('/').split('/')
+                    candidates.append('/' + parts[-1])
+                    candidates.append(parts[-1])
+
+                seen = []
+                for cand in candidates:
+                    api_p = '' if cand in ('', '/') or cand is None else cand
+                    if api_p in seen:
+                        continue
+                    seen.append(api_p)
+                    try:
+                        res = dbx.files_list_folder(api_p, recursive=False)
+                        return api_p, res.entries
+                    except ApiError as e:
+                        # if missing_scope propagate, else continue
+                        try:
+                            if isinstance(e.error, AuthError) or (hasattr(e, 'error') and getattr(e.error, 'is_path', lambda: False)()):
+                                pass
+                        except Exception:
+                            pass
+                        continue
+                return None, []
+
+            if st.button('Ordner öffnen'):
+                api_path, entries = probe_candidates(dbx, configured_path)
+                if api_path is None:
+                    st.error('Pfad nicht gefunden. Setze st.secrets["dropbox"]["path"] korrekt oder lade Root ("" ) als Test.')
+                else:
+                    # persist current working API path in session
+                    st.session_state['db_current_api_path'] = api_path
+                    folders = [e for e in entries if isinstance(e, FolderMetadata)]
+                    files = [e for e in entries if isinstance(e, FileMetadata)]
+
+                    if folders:
+                        st.write('Ordner:')
+                        for f in sorted(folders, key=lambda x: x.name):
+                            if st.button(f"Öffnen: {f.name}", key=f"open_{f.path_lower}"):
+                                st.session_state['db_current_api_path'] = f.path_lower
+                                st.experimental_rerun()
+
+                    if files:
+                        opts = [f.path_display for f in files]
+                        sel = st.multiselect('Wähle Dateien', opts)
+                        if st.button('Herunterladen ausgewählter Dateien'):
+                            downloaded = []
+                            for disp in sel:
+                                remote = next((x.path_lower for x in files if x.path_display==disp), None)
+                                if remote:
+                                    try:
+                                        lp = download_dropbox_file(token, remote, workdir)
+                                        downloaded.append(lp)
+                                    except Exception as e:
+                                        st.error(f"Download fehlgeschlagen: {disp} — {e}")
+                            if downloaded:
+                                recursively_extract_archives(workdir)
+                                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
+                    if not folders and not files:
+                        st.info('0 Datei(en) gefunden.')
 
 # ---------------- Parameters / QC ----------------
-st.subheader("2) Parameter / QC")
-with st.expander("Hilfe zu Parametern", expanded=False):
+st.subheader('2) Parameter / QC')
+with st.expander('Hilfe zu Parametern', expanded=False):
     st.markdown("""
 **Glättungsfenster (Sessions)**  
-- Anzahl Sessions für die Trend-Glättung. Größer = glatter, kleiner = detailreicher. Empfehlung: 3–7.
+- Anzahl Sessions für die Trend-Glättung. Empfehlung: 3–7.
 
 **Outlier z-Schwelle**  
 - Markiert Messwerte mit hoher Abweichung. Empfehlung: 2.5–3.5.
 
 **Sampling-Rate (Hz)**  
-- Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass). Häufig 250 Hz.
+- Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass).
 
 **Preprocessing**  
-- Notch entfernt Netzstörungen (50/60 Hz). Bandpass begrenzt auf 0.5–45 Hz.
-- Nur aktivieren wenn CSV Rohzeitreihen enthält. SciPy benötigt.
-
-**Was sind "Endsessions"?**  
-- "Endsessions" = die neuesten N Sessions nach Timestamp.
+- Notch entfernt Netzstörungen. Bandpass begrenzt auf 0.5–45 Hz.
 """)
-smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
-outlier_z = st.slider("Outlier z-Schwelle", min_value=1.5, max_value=5.0, value=3.0, step=0.5)
-fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
-do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=(True and HAS_SCIPY))
+
+smooth = st.slider('Glättungsfenster (Sessions)', min_value=3, max_value=11, value=5, step=2)
+outlier_z = st.slider('Outlier z-Schwelle', min_value=1.5, max_value=5.0, value=3.0, step=0.5)
+fs = st.number_input('Sampling-Rate für Preprocessing (Hz)', value=250.0, step=1.0)
+do_preproc = st.checkbox('Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden', value=(True and HAS_SCIPY))
 
 # ---------------- collect CSVs ----------------
-csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
-                 if os.path.isfile(p) and p.lower().endswith(".csv")]
+csv_paths_all = [p for p in glob.glob(os.path.join(workdir, '**', '*'), recursive=True)
+                 if os.path.isfile(p) and p.lower().endswith('.csv')]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
-st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
-MAX_PREPROC_MB = 200
-if total_mb > MAX_PREPROC_MB and do_preproc:
-    st.warning(f"Preprocessing automatisch deaktiviert (Gesamt {total_mb:.0f} MB > {MAX_PREPROC_MB} MB).")
-    do_preproc = False
+st.info(f'Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB')
 
 # ---------------- Session selection ----------------
-st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
-sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
+st.markdown('**Wähle, welche Sessions verarbeitet werden sollen**')
+sel_mode = st.selectbox('Modus', ['Alle Sessions (default)', 'Letzte Tage', 'Letzte N Sessions'])
 selected_csvs = csv_paths_all.copy()
-if sel_mode == "Letzte Tage":
-    days_opt = st.selectbox("Zeitraum", ["1 Tag", "3 Tage", "7 Tage", "14 Tage"], index=2)
-    days_map = {"1 Tag":1, "3 Tage":3, "7 Tage":7, "14 Tage":14}
+
+if sel_mode == 'Letzte Tage':
+    days_opt = st.selectbox('Zeitraum', ['1 Tag','3 Tage','7 Tage','14 Tage'], index=2)
+    days_map = {'1 Tag':1,'3 Tage':3,'7 Tage':7,'14 Tage':14}
     days = days_map[days_opt]
     now = datetime.now()
-    selected = []
-    for p in csv_paths_all:
-        dt = parse_dt_from_path(p)
-        if dt is not None and dt >= (now - timedelta(days=days)):
-            selected.append(p)
+    selected = [p for p in csv_paths_all if (parse_dt_from_path(p) is not None and parse_dt_from_path(p) >= (now - timedelta(days=days)))]
     selected_csvs = sorted(selected)
     st.info(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
-elif sel_mode == "Letzte N Sessions":
+
+elif sel_mode == 'Letzte N Sessions':
     parsed = [(p, parse_dt_from_path(p)) for p in csv_paths_all]
     parsed = [t for t in parsed if t[1] is not None]
     if not parsed:
-        st.warning("Keine mit Timestamp erkennbaren Sessions gefunden. Wähle 'Alle Sessions' oder 'Letzte Tage'.")
+        st.warning('Keine mit Timestamp erkennbaren Sessions gefunden. Wähle "Alle Sessions" oder "Letzte Tage".')
         selected_csvs = []
     else:
         parsed_sorted = sorted(parsed, key=lambda x: x[1])
         max_n = len(parsed_sorted)
         default_n = min(30, max_n)
-        n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n, value=default_n, step=1)
+        n_sel = st.number_input('Anzahl neuester Sessions', min_value=1, max_value=max_n, value=default_n, step=1)
         selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
         st.info(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
 else:
     st.info(f"{len(selected_csvs)} Sessions (Alle)")
 
-limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
+limit_sessions = st.checkbox('Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)', value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
-    sel_n2 = st.number_input(f"Wenn aktiv: verarbeite nur die neuesten N aus der Auswahl (max {len(selected_csvs)})",
-                             min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
+    sel_n2 = st.number_input(f'Wenn aktiv: verarbeite nur die neuesten N aus der Auswahl (max {len(selected_csvs)})', min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
     if sel_n2 < len(selected_csvs):
         parsed2 = [(p, parse_dt_from_path(p)) for p in selected_csvs]
         parsed2 = [t for t in parsed2 if t[1] is not None]
         parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
         st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
+
 st.info(f"{len(selected_csvs)} Sessions ausgewählt.")
 
 # ---------------- Run analysis ----------------
-if st.button("Auswertung starten"):
+if st.button('Auswertung starten'):
     recursively_extract_archives(workdir)
-    csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
-                     if os.path.isfile(p) and p.lower().endswith(".csv")]
+    csv_paths_all = [p for p in glob.glob(os.path.join(workdir, '**', '*'), recursive=True)
+                     if os.path.isfile(p) and p.lower().endswith('.csv')]
     csv_paths_all = sorted(csv_paths_all)
     basenames_map = {os.path.basename(p): p for p in csv_paths_all}
+
     resolved_selected = []
     for p in selected_csvs:
         b = os.path.basename(p)
@@ -531,40 +530,44 @@ if st.button("Auswertung starten"):
             resolved_selected.append(basenames_map[b])
     if not resolved_selected:
         resolved_selected = csv_paths_all
+
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
+
     if len(resolved_selected) == 0:
-        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP/Dropbox-Inhalt neu hoch.")
+        st.error('Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP/Dropbox-Inhalt neu hoch.')
     else:
-        tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
+        tmpdir = tempfile.mkdtemp(prefix='eeg_proc_')
         container = st.empty()
         df = build_session_table_from_list(resolved_selected, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
         try:
             shutil.rmtree(tmpdir)
         except Exception:
             pass
+
         if df.empty:
-            st.error("Keine gültigen Sessions (mit Bandspalten) gefunden. Prüfe Dateiformat.")
+            st.error('Keine gültigen Sessions (mit Bandspalten) gefunden. Prüfe Dateiformat.')
         else:
             faa_list = []
             for cp in resolved_selected:
-                faa = try_compute_faa_from_csv(cp)
+                faa = try_compute_faa_from_csv(cp) if 'try_compute_faa_from_csv' in globals() else None
                 if faa is not None:
-                    faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
+                    faa_list.append({'session': os.path.basename(cp), 'faa': float(faa)})
             faa_df = pd.DataFrame(faa_list)
+
             if len(df) == 1:
-                st.subheader("Einzel-Session Analyse")
+                st.subheader('Einzel-Session Analyse')
                 st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
                 st.dataframe(df.round(4))
                 if not faa_df.empty:
-                    st.write("FAA (geschätzt) für einzelne Sessions:"); st.dataframe(faa_df.round(4))
+                    st.write('FAA (geschätzt) für einzelne Sessions:'); st.dataframe(faa_df.round(4))
             else:
-                st.subheader("Stress/Entspannung (ohne Lücken)")
+                st.subheader('Stress/Entspannung (ohne Lücken)')
                 st.plotly_chart(plot_stress_relax(df, smooth=smooth, outlier_z=outlier_z), use_container_width=True)
-                st.subheader("Bänder + Stress-/Entspannungswellen")
+                st.subheader('Bänder + Stress-/Entspannungswellen')
                 st.plotly_chart(plot_bands(df, smooth=smooth), use_container_width=True)
-                st.subheader("Session Übersicht (Tabelle)")
+                st.subheader('Session Übersicht (Tabelle)')
                 st.dataframe(df.round(4))
+
             df_out = df.copy()
-            df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-            st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
-                               file_name="summary_indices.csv", mime="text/csv")
+            df_out['date_str'] = df_out['datetime'].dt.strftime('%Y-%m-%d %H:%M:%S')
+            st.download_button('Summary CSV herunterladen', data=df_out.to_csv(index=False).encode('utf-8'), file_name='summary_indices.csv', mime='text/csv')
