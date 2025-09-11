@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App - Version v3
+EEG-Auswertung Streamlit App - Version v4
 Adds:
-- Auto-disable heavy preprocessing for large total CSV size
-- Progress bar during processing
-- Option to limit processing to newest N sessions
-Save as app_streamlit_v3.py and deploy like before.
+- Selection controls to limit which sessions from the package are analysed:
+  * All (default)
+  * Last 1 day, 3 days, 7 days, 14 days
+  * Last N sessions
+Behavior:
+- Filtration uses timestamps parsed from filenames (pattern brainzz_YYYY-MM-DD--HH-MM-SS).
+- If a file lacks a parsable timestamp it is ignored for time-based filters but can be included when "All" or "Last N sessions" is selected (Last N uses those with timestamps).
+Save as app_streamlit_v4.py and deploy like before.
 """
 
 import os, io, zipfile, glob, re, tempfile, shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -32,9 +36,9 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-st.set_page_config(page_title="EEG-Auswertung (v3)", layout="wide")
-st.title("EEG-Auswertung — v3 (Performance & QC)")
-st.caption("Automatische Beschränkung, Preproc-Auto-disable, Fortschrittsanzeige.")
+st.set_page_config(page_title="EEG-Auswertung (v4)", layout="wide")
+st.title("EEG-Auswertung — v4 (Session-Selection)")
+st.caption("Wähle, wie viele Sessions aus dem Paket analysiert werden sollen.")
 
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
@@ -47,6 +51,7 @@ def parse_dt_from_path(path: str):
     except Exception:
         return None
 
+# (kept preprocessing and plotting helpers identical to v3 for brevity)
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
     if not HAS_SCIPY:
         return x
@@ -108,7 +113,6 @@ def load_session_relatives(csv_path: str) -> pd.DataFrame | None:
     rel = rel.div(total, axis=0).dropna()
     return rel
 
-# new: build from a given list of csv paths, with progress bar
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
     rows = []
     total = max(1, len(csv_paths))
@@ -299,7 +303,8 @@ do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vo
 st.write("SciPy installiert:", HAS_SCIPY, "  Paramiko (SFTP):", HAS_PARAMIKO)
 
 # --- New: Quick-check of file count and total size, option to limit newest N ---
-csv_paths_all = glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)
+csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
+                 if os.path.isfile(p) and p.lower().endswith(".csv")]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
@@ -309,13 +314,47 @@ if total_mb > MAX_PREPROC_MB and do_preproc:
     st.warning(f"Preprocessing automatisch deaktiviert (Gesamt {total_mb:.0f} MB > {MAX_PREPROC_MB} MB).")
     do_preproc = False
 
-limit_sessions = st.checkbox("Beschränke Verarbeitung auf neueste N Sessions (beschleunigt)", value=False)
-max_n = n_csv if n_csv>0 else 0
-if limit_sessions and n_csv>0:
-    default_n = min(100, n_csv)
-    sel_n = st.number_input(f"Neueste N Sessions verarbeiten (max {n_csv})", min_value=1, max_value=n_csv, value=default_n, step=1)
+# -- Session selection UI: by timeframe or last N sessions --
+st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
+sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
+selected_csvs = csv_paths_all.copy()
+
+if sel_mode == "Letzte Tage":
+    days_opt = st.selectbox("Zeitraum", ["1 Tag", "3 Tage", "7 Tage", "14 Tage"], index=2)
+    days_map = {"1 Tag":1, "3 Tage":3, "7 Tage":7, "14 Tage":14}
+    days = days_map[days_opt]
+    now = datetime.now()
+    selected = []
+    for p in csv_paths_all:
+        dt = parse_dt_from_path(p)
+        if dt is not None and dt >= (now - timedelta(days=days)):
+            selected.append(p)
+    selected_csvs = sorted(selected)
+    st.write(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
+elif sel_mode == "Letzte N Sessions":
+    max_n = len(csv_paths_all)
+    default_n = min(30, max_n) if max_n>0 else 0
+    n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n if max_n>0 else 1, value=default_n, step=1)
+    # choose newest by parsed datetime; if parse fails, exclude
+    parsed = [(p, parse_dt_from_path(p)) for p in csv_paths_all]
+    parsed = [t for t in parsed if t[1] is not None]
+    parsed_sorted = sorted(parsed, key=lambda x: x[1])
+    selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
+    st.write(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
 else:
-    sel_n = None
+    st.write(f"{len(selected_csvs)} Sessions (Alle)")
+
+limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
+if limit_sessions and len(selected_csvs)>0:
+    default_n2 = min(100, len(selected_csvs))
+    sel_n2 = st.number_input(f"Wenn aktiv: verarbeite nur die neuesten N aus der Auswahl (max {len(selected_csvs)})", min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
+    if sel_n2 < len(selected_csvs):
+        # sort selected by parsed date and keep newest sel_n2
+        parsed2 = [(p, parse_dt_from_path(p)) for p in selected_csvs]
+        parsed2 = [t for t in parsed2 if t[1] is not None]
+        parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
+        selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
+        st.write(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
 
 if st.button("Auswertung starten"):
     # extract inner zips
@@ -329,22 +368,27 @@ if st.button("Auswertung starten"):
         except zipfile.BadZipFile:
             pass
 
-    # refresh csv list after extraction
-    csv_paths_all = glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)
-    csv_paths_all = sorted(csv_paths_all)
-    if sel_n is not None and sel_n>0:
-        csv_paths = csv_paths_all[-int(sel_n):]
-        st.info(f"Verarbeite die neuesten {sel_n} Sessions von {len(csv_paths_all)} insgesamt.")
-    else:
-        csv_paths = csv_paths_all
-        st.info(f"Verarbeite alle {len(csv_paths)} Sessions.")
+    # refresh selection after extraction: recompute csv_paths_all and intersect with selected_csvs by basename if needed
+    csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
+                     if os.path.isfile(p) and p.lower().endswith(".csv")]
+    # if selection was built before extraction, re-resolve by basename matching
+    basenames = {os.path.basename(p): p for p in csv_paths_all}
+    resolved_selected = []
+    for p in selected_csvs:
+        b = os.path.basename(p)
+        if b in basenames:
+            resolved_selected.append(basenames[b])
+    # if selection empty after resolution, fall back to all csvs
+    if not resolved_selected:
+        resolved_selected = csv_paths_all
+
+    # show final count
+    st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
 
     # temp dir for preprocessing outputs
     tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
-    # pass a container for progress UI
     container = st.empty()
-    df = build_session_table_from_list(csv_paths, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
-    # cleanup tmpdir
+    df = build_session_table_from_list(resolved_selected, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
     try:
         shutil.rmtree(tmpdir)
     except Exception:
@@ -353,9 +397,8 @@ if st.button("Auswertung starten"):
     if df.empty:
         st.error("Keine gültigen Sessions gefunden. Prüfe ZIP-Inhalt.")
     else:
-        # FAA attempt
         faa_list = []
-        for cp in csv_paths:
+        for cp in resolved_selected:
             faa = try_compute_faa_from_csv(cp)
             if faa is not None:
                 faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
