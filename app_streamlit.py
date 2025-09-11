@@ -1,16 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App (vollständig)
-- Dropbox: manuelle Dateiauswahl mit Multiselect + Navigation
-- Pfad-Persistenz via st.session_state
-- Robuste Pfad-Normalisierung ('' = App-root; sonst führender '/')
+EEG-Auswertung Streamlit App
+- Dropbox: kein Verzeichniswechsel, nur Dateien im konfigurierten Ordner
+- Checkbox "Alle auswählen" + Multiselect
 - ZIP/SIP werden nach Download rekursiv extrahiert
-- Analyse wie zuvor (Stress/Entspannung, Bänder, FAA)
-
-Start: streamlit run app_streamlit.py
-Erforderliche Pakete (requirements): streamlit, numpy, pandas, plotly, dropbox
- Optional: scipy, paramiko
+- Analyse (Stress/Entspannung, Bänder, FAA)
 """
 
 import os
@@ -29,7 +24,7 @@ from ftplib import FTP
 import plotly.express as px
 import plotly.graph_objects as go
 
-# optionale Libs
+# optional
 try:
     import paramiko
     HAS_PARAMIKO = True
@@ -42,7 +37,7 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# Dropbox SDK
+# Dropbox
 try:
     import dropbox
     from dropbox.files import FileMetadata, FolderMetadata
@@ -53,7 +48,7 @@ except Exception:
 
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 
-# ---------------- Styling ----------------
+# ---------- Styles ----------
 st.markdown("""
 <style>
 :root{ --expander-bg:#e9ecef; --expander-text:#0b3d91; --expander-open-bg:#28a745; --expander-open-text:#fff }
@@ -65,7 +60,7 @@ details[open] > summary{ background:var(--expander-open-bg)!important; color:var
 st.title("EEG-Auswertung")
 st.caption("ZIP/FTP/SFTP/Dropbox → Dateien wählen → Auswertung starten")
 
-# ---------------- Helper: Time from filename ----------------
+# ---------- Helpers ----------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path: str):
@@ -77,7 +72,6 @@ def parse_dt_from_path(path: str):
     except Exception:
         return None
 
-# ---------------- Signal helpers ----------------
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
     if not HAS_SCIPY:
         return x
@@ -152,7 +146,6 @@ def try_compute_faa_from_csv(csv_path):
         return np.log(right+1e-9) - np.log(left+1e-9)
     return None
 
-# ---------------- Plotting ----------------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
             "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
@@ -205,7 +198,6 @@ def plot_bands(df, smooth=5):
     fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
     return fig
 
-# ---------------- Archive extraction ----------------
 def recursively_extract_archives(root_dir):
     changed = True
     while changed:
@@ -233,9 +225,9 @@ def recursively_extract_archives(root_dir):
             except Exception:
                 continue
 
-# ---------------- Dropbox helpers ----------------
+# ---------- Dropbox helpers ----------
 def normalize_api_path(p: str) -> str:
-    """'' -> app-root; sonst String mit führendem '/'."""
+    """'' -> app-root; sonst führender '/'."""
     if p is None:
         return ""
     s = str(p).strip().replace("\\", "/")
@@ -244,7 +236,7 @@ def normalize_api_path(p: str) -> str:
     return s if s.startswith("/") else "/" + s
 
 def list_folder(dbx, api_path: str):
-    """Liste direkten Inhalt eines Ordners. Gibt (folders, files) zurück oder wirft verständliche Fehler in UI."""
+    """Nur direkte Einträge des konfigurierten Ordners."""
     try:
         res = dbx.files_list_folder(api_path, recursive=False)
         entries = res.entries
@@ -252,7 +244,6 @@ def list_folder(dbx, api_path: str):
         st.error("AuthError: Token ohne nötige Scopes. Aktiviere files.metadata.read + files.content.read und erzeuge ein neues Token.")
         return [], []
     except ApiError as e:
-        # Not-found sauber melden
         try:
             if hasattr(e.error, "get_path") and e.error.get_path() and e.error.get_path().is_not_found():
                 st.error("Pfad nicht gefunden. Prüfe st.secrets['dropbox']['path'] und App-Typ (App folder vs Full Dropbox).")
@@ -279,7 +270,7 @@ def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
         dbx.files_download_to_file(local_path, remote_path)
     return local_path
 
-# ---------------- Build session table ----------------
+# ---------- Build table ----------
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
     rows = []
     total = max(1, len(csv_paths))
@@ -323,13 +314,13 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
         df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
     return df
 
-# ---------------- UI ----------------
+# ---------- UI ----------
 st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
 
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
 
-# Datei-Upload
+# Upload
 if mode == "Datei-Upload (ZIP)":
     up = st.file_uploader("ZIP-Datei hochladen (Paket mit CSVs/SIPs)", type=["zip"])
     if up is not None:
@@ -396,7 +387,7 @@ elif mode == "SFTP (optional)":
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
-# Dropbox: manuelle Auswahl mit Navigation
+# Dropbox: nur konfigurierter Ordner, keine Navigation
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
         st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
@@ -405,71 +396,40 @@ elif mode == "Dropbox":
         configured_path = st.secrets.get("dropbox", {}).get("path") if "dropbox" in st.secrets else ""
         if configured_path is None:
             configured_path = ""
+        api_path = normalize_api_path(configured_path)
 
         if not token:
-            st.error("Dropbox-Token nicht gefunden. Lege access_token in st.secrets['dropbox'] oder DROPBOX_TOKEN als Env an.")
+            st.error("Dropbox-Token fehlt. st.secrets['dropbox']['access_token'] setzen oder DROPBOX_TOKEN.")
         else:
-            # Pfad-Persistenz
-            if "db_current_api_path" not in st.session_state:
-                st.session_state["db_current_api_path"] = normalize_api_path(configured_path)
-
-            api_path = st.session_state["db_current_api_path"]
-            display_path = api_path if api_path != "" else "(app-root)"
-            st.markdown(f"**Dropbox-Ordner (aktiv):** `{display_path}`")
-
+            st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # Listing bei jedem Run, damit Auswahl nicht verschwindet
+            # Liste Dateien im Ordner (keine Rekursion, keine Navigation)
             folders, files = list_folder(dbx, api_path)
 
-            # Navigation
-            cols_nav = st.columns(3)
-            with cols_nav[0]:
-                if st.button("🔄 Aktualisieren"):
-                    folders, files = list_folder(dbx, api_path)
-            with cols_nav[1]:
-                # eine Ebene hoch
-                if api_path:
-                    parent = "/" + "/".join([p for p in api_path.strip("/").split("/")[:-1]]) if "/" in api_path.strip("/") else ""
-                    if st.button("⬆️ Eine Ebene hoch"):
-                        st.session_state["db_current_api_path"] = parent
-                        st.experimental_rerun()
-            with cols_nav[2]:
-                # Direct jump to 'Dailys' if vorhanden
-                if any(f.name.lower() == "dailys" for f in folders):
-                    if st.button("➡️ In 'Dailys' wechseln"):
-                        target = next(f.path_lower for f in folders if f.name.lower()=="dailys")
-                        st.session_state["db_current_api_path"] = target
-                        st.experimental_rerun()
+            # Nur ZIP/CSV/SIP anzeigen
+            visible_files = [f for f in files if f.name.lower().endswith((".zip",".csv",".sip"))]
 
-            # Ordnerliste mit Buttons zum Öffnen
-            if folders:
-                st.write("**Ordner:**")
-                for f in sorted(folders, key=lambda x: x.name):
-                    if st.button(f"Öffnen: {f.name}", key=f"open_{f.path_lower}"):
-                        st.session_state["db_current_api_path"] = f.path_lower
-                        st.experimental_rerun()
-
-            # Dateien anzeigen: nur ZIP/CSV
+            # Persistente Auswahl
             st.session_state.setdefault("db_files_map", [])
             st.session_state.setdefault("db_selected_files", [])
 
-            visible_files = [f for f in files if f.name.lower().endswith((".zip",".csv",".sip"))]
             if visible_files:
                 files_map = [(f.path_display, f.path_lower) for f in visible_files]
                 st.session_state["db_files_map"] = files_map
-
                 options = [t[0] for t in files_map]
-                # vorausgewählte behalten
-                default_selected = [s for s in st.session_state["db_selected_files"] if s in options]
 
+                # Checkbox "Alle auswählen"
+                all_toggle = st.checkbox("Alle auswählen", value=False)
+                if all_toggle:
+                    st.session_state["db_selected_files"] = options
+
+                # Multiselect mit persistenter Auswahl
+                default_selected = [s for s in st.session_state["db_selected_files"] if s in options]
                 sel = st.multiselect("Wähle Datei(en) (ZIP/CSV)", options, default=default_selected)
                 st.session_state["db_selected_files"] = sel
 
-                if st.checkbox("Alle auswählen"):
-                    st.session_state["db_selected_files"] = options
-                    sel = options
-
+                # Download
                 if st.button("Herunterladen ausgewählter Dateien"):
                     if not sel:
                         st.warning("Keine Datei ausgewählt.")
@@ -489,17 +449,17 @@ elif mode == "Dropbox":
                             recursively_extract_archives(workdir)
                             st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
             else:
-                st.info("0 Datei(en) im aktuellen Ordner (nur direkte Einträge, nicht rekursiv).")
+                st.info("0 Datei(en) im Ordner. Die App listet nur direkte Einträge (keine Unterordner).")
 
-# ---------------- Parameter / QC ----------------
+# ---------- Parameter / QC ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
 **Glättungsfenster (Sessions)**  
-- Anzahl Sessions für die Trend-Glättung. Empfehlung: 3–7.
+- Sessions für Trend-Glättung. Empfehlung: 3–7.
 
 **Outlier z-Schwelle**  
-- Markiert Messwerte mit hoher Abweichung. Empfehlung: 2.5–3.5.
+- Markiert starke Ausreißer. Empfehlung: 2.5–3.5.
 
 **Sampling-Rate (Hz)**  
 - Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass).
@@ -508,16 +468,16 @@ with st.expander("Hilfe zu Parametern", expanded=False):
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
 outlier_z = st.slider("Outlier z-Schwelle", min_value=1.5, max_value=5.0, value=3.0, step=0.5)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
-do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=(True and HAS_SCIPY))
+do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
 
-# ---------------- CSV sammeln ----------------
+# ---------- CSV sammeln ----------
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                  if os.path.isfile(p) and p.lower().endswith(".csv")]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
 
-# ---------------- Auswahl der Sessions ----------------
+# ---------- Auswahl der Sessions ----------
 st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
 sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
 selected_csvs = csv_paths_all.copy()
@@ -551,21 +511,21 @@ elif sel_mode == "Letzte N Sessions":
 else:
     st.info(f"{len(selected_csvs)} Sessions (Alle)")
 
-limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
+limit_sessions = st.checkbox("Beschränke zusätzlich auf neueste N (beschleunigt)", value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
-    sel_n2 = st.number_input(f"Wenn aktiv: verarbeite nur die neuesten N aus der Auswahl (max {len(selected_csvs)})",
+    sel_n2 = st.number_input(f"Wenn aktiv: nur neueste N aus Auswahl (max {len(selected_csvs)})",
                              min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
     if sel_n2 < len(selected_csvs):
         parsed2 = [(p, parse_dt_from_path(p)) for p in selected_csvs]
         parsed2 = [t for t in parsed2 if t[1] is not None]
         parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
-        st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
+        st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2}).")
 
 st.info(f"{len(selected_csvs)} Sessions ausgewählt.")
 
-# ---------------- Auswertung starten ----------------
+# ---------- Auswertung ----------
 if st.button("Auswertung starten"):
     recursively_extract_archives(workdir)
 
@@ -585,7 +545,7 @@ if st.button("Auswertung starten"):
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
 
     if len(resolved_selected) == 0:
-        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP/Dropbox-Inhalt neu hoch.")
+        st.error("Keine CSVs zum Verarbeiten gefunden.")
     else:
         tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
         container = st.empty()
@@ -596,9 +556,8 @@ if st.button("Auswertung starten"):
             pass
 
         if df.empty:
-            st.error("Keine gültigen Sessions (mit Bandspalten) gefunden. Prüfe Dateiformat.")
+            st.error("Keine gültigen Sessions (mit Bandspalten) gefunden.")
         else:
-            # optional FAA
             faa_list = []
             for cp in resolved_selected:
                 faa = try_compute_faa_from_csv(cp)
