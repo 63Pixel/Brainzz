@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App
+EEG-Auswertung Streamlit App (gepatcht)
+- Expander-Farben per CSS (anpassbar)
+- Sessions-Vorschau entfernt (nur noch kompakte Info)
 - Rekursive Extraktion (.zip/.sip)
-- Kategorie-X-Achsen Plotly
+- Session-Auswahl: Alle / Letzte Tage / Letzte N Sessions
 - Hilfe-Expander standardmäßig eingeklappt
-- "Alle Sessions" Ansicht: Hervorhebung letzter Tage / neueste N (Badges)
-- Keine Debug-Ausgaben / keine SciPy/Paramiko-Statuszeile
 """
 import os
 import io
@@ -23,7 +23,7 @@ from ftplib import FTP
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Optional libs
+# optional libs
 try:
     import paramiko
     HAS_PARAMIKO = True
@@ -38,7 +38,7 @@ except Exception:
 
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 
-# --- CSS für Badges ---
+# --- Badge CSS ---
 st.markdown("""
 <style>
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;color:#fff;font-size:12px;margin-right:8px}
@@ -49,10 +49,41 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# --- Expander color CSS (edit hex values to change colors) ---
+st.markdown("""
+<style>
+:root{
+  --expander-bg: #e9ecef;
+  --expander-text: #0b3d91;
+  --expander-open-bg: #28a745;
+  --expander-open-text: #ffffff;
+}
+div.stExpander > div[data-testid="stExpander"] > details > summary,
+details > summary {
+  background: var(--expander-bg) !important;
+  color: var(--expander-text) !important;
+  padding: 8px 12px !important;
+  border-radius: 8px !important;
+  margin-bottom: 6px !important;
+  outline: none !important;
+  cursor: pointer;
+}
+details[open] > summary,
+div.stExpander[open] > summary {
+  background: var(--expander-open-bg) !important;
+  color: var(--expander-open-text) !important;
+}
+div.stExpander > div[data-testid="stExpander"] {
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("EEG-Auswertung")
 st.caption("Interaktive Auswertung. ZIP/FTP/SFTP hochladen, Sessions auswählen, Analyse starten.")
 
-# Regex to parse filename timestamps like: brainzz_2025-09-05--09-47-44
+# regex for filenames like brainzz_YYYY-MM-DD--HH-MM-SS
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path):
@@ -64,7 +95,7 @@ def parse_dt_from_path(path):
     except Exception:
         return None
 
-# --- optional signal processing helpers (best-effort)
+# optional signal processing helpers
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
     if not HAS_SCIPY:
         return x
@@ -189,7 +220,7 @@ def try_compute_faa_from_csv(csv_path):
         return np.log(right+1e-9) - np.log(left+1e-9)
     return None
 
-# --- Plot helpers (Plotly) ---
+# plotting helpers
 def plot_single_session_interactive(df):
     vals = {
         "Stress": df["stress"].iloc[0],
@@ -246,7 +277,7 @@ def plot_bands(df, smooth=5):
     fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
     return fig
 
-# ---------------- helper: recursive extraction of nested archives ----------------
+# recursive extraction for nested archives
 def recursively_extract_archives(root_dir):
     changed = True
     while changed:
@@ -370,7 +401,7 @@ outlier_z = st.slider("Outlier z-Schwelle", min_value=1.5, max_value=5.0, value=
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=(True and HAS_SCIPY))
 
-# --- gather CSVs robustly (case-insensitive) ---
+# gather csvs recursively
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                  if os.path.isfile(p) and p.lower().endswith(".csv")]
 n_csv = len(csv_paths_all)
@@ -398,7 +429,7 @@ if sel_mode == "Letzte Tage":
         if dt is not None and dt >= (now - timedelta(days=days)):
             selected.append(p)
     selected_csvs = sorted(selected)
-    st.write(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
+    st.info(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
 
 elif sel_mode == "Letzte N Sessions":
     parsed = [(p, parse_dt_from_path(p)) for p in csv_paths_all]
@@ -412,54 +443,12 @@ elif sel_mode == "Letzte N Sessions":
         default_n = min(30, max_n)
         n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n, value=default_n, step=1)
         selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
-        st.write(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
+        st.info(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
 
 else:
-    # Alle Sessions: show count and offer highlight config
-    st.write(f"{len(selected_csvs)} Sessions (Alle)")
+    st.info(f"{len(selected_csvs)} Sessions (Alle)")
 
-    with st.expander("Hervorhebung einstellen (letzte Tage / neueste N)", expanded=False):
-        days_opt2 = st.selectbox("Markiere Sessions der letzten Tage (Keine = aus)",
-                                ["Keine", "1 Tag", "3 Tage", "7 Tage", "14 Tage"], index=0)
-        days_map2 = {"Keine": 0, "1 Tag":1, "3 Tage":3, "7 Tage":7, "14 Tage":14}
-        highlight_days = days_map2[days_opt2]
-
-        if n_csv > 0:
-            highlight_newest_n = st.number_input("Markiere neueste N Sessions (0 = aus)",
-                                                min_value=0, max_value=n_csv, value=0, step=1)
-        else:
-            highlight_newest_n = 0
-            st.write("Keine CSVs gefunden, daher keine Markierung möglich.")
-
-    # compute highlight sets
-    recent_set = set()
-    newest_set = set()
-    if highlight_days and highlight_days > 0:
-        now = datetime.now()
-        for p in selected_csvs:
-            dt = parse_dt_from_path(p)
-            if dt is not None and dt >= (now - timedelta(days=highlight_days)):
-                recent_set.add(os.path.basename(p))
-    if highlight_newest_n and highlight_newest_n > 0:
-        parsed = [(p, parse_dt_from_path(p)) for p in selected_csvs]
-        parsed = [t for t in parsed if t[1] is not None]
-        parsed_sorted = sorted(parsed, key=lambda x: x[1])
-        newest = [os.path.basename(p) for p,_ in parsed_sorted[-int(highlight_newest_n):]]
-        newest_set.update(newest)
-
-    st.write("Sessions (Vorschau):")
-    for p in sorted(selected_csvs):
-        b = os.path.basename(p)
-        badge_html = ""
-        if b in recent_set and b in newest_set:
-            badge_html = "<span class='badge badge-both'>beide</span>"
-        elif b in recent_set:
-            badge_html = "<span class='badge badge-recent'>letzte Tage</span>"
-        elif b in newest_set:
-            badge_html = "<span class='badge badge-newest'>neueste N</span>"
-        st.markdown(f"<div class='session-row'>{badge_html}{b}</div>", unsafe_allow_html=True)
-
-# optional limiter for large selections
+# optional limiter
 limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
@@ -470,7 +459,10 @@ if limit_sessions and len(selected_csvs)>0:
         parsed2 = [t for t in parsed2 if t[1] is not None]
         parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
-        st.write(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
+        st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
+
+# compact info instead of preview
+st.info(f"{len(selected_csvs)} Sessions ausgewählt.")
 
 # ---------------- Run analysis ----------------
 if st.button("Auswertung starten"):
