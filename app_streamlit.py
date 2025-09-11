@@ -187,7 +187,11 @@ def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
 
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
     rows=[]
-    for cp in sorted(csv_paths):
+    total = max(1, len(csv_paths))
+    if st_container is not None:
+        progress = st_container.progress(0)
+        status_text = st_container.empty()
+    for i, cp in enumerate(sorted(csv_paths), start=1):
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
         if dt is None: continue
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
@@ -199,6 +203,11 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
             "datetime": dt, "alpha":alpha,"beta":beta,"theta":theta,"delta":delta,"gamma":gamma,
             "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
         })
+        if st_container is not None:
+            progress.progress(int(i/total*100))
+            status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
+    if st_container is not None:
+        progress.empty(); status_text.empty()
     df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
     if not df.empty: df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
     return df
@@ -207,6 +216,7 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
 st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
+selected_paths = [] # Initialize selected_paths outside of the 'if' block to make it accessible
 
 # Datei-Upload
 if mode == "Datei-Upload (ZIP)":
@@ -311,9 +321,9 @@ elif mode == "Dropbox":
                     gb = GridOptionsBuilder.from_dataframe(df_files)
                     # Nur Beschreibung zeigen
                     gb.configure_column("description", header_name="Datum · Größe",
-                                        checkboxSelection=True, headerCheckboxSelection=True,
-                                        headerCheckboxSelectionFilteredOnly=True,
-                                        sortable=True, filter=True, resizable=True)
+                                         checkboxSelection=True, headerCheckboxSelection=True,
+                                         headerCheckboxSelectionFilteredOnly=True,
+                                         sortable=True, filter=True, resizable=True)
                     # Verstecken
                     for col in ["path_lower","path_display","dt","size_kb"]:
                         gb.configure_column(col, hide=True)
@@ -371,7 +381,7 @@ elif mode == "Dropbox":
                         if downloaded:
                             recursively_extract_archives(workdir)
                             st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
-
+            
 # --------- Parameter / QC (behalten, kompakt) ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
@@ -388,28 +398,51 @@ do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value
 # --------- CSV-Suche im Arbeitsverzeichnis ---------
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir,"**","*"), recursive=True)
                  if os.path.isfile(p) and p.lower().endswith(".csv")]
-st.info(f"Gefundene CSVs: {len(csv_paths_all)}")
+n_csv = len(csv_paths_all)
+total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
+st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
 
-# --------- Auswertung: immer auf allen gefundenen CSVs im workdir ---------
+# --------- Auswertung: jetzt mit der richtigen Dateiauswahl ---------
 if st.button("Auswertung starten"):
     recursively_extract_archives(workdir)
-    csv_paths_all = [p for p in glob.glob(os.path.join(workdir,"**","*"), recursive=True)
-                     if os.path.isfile(p) and p.lower().endswith(".csv")]
-    if not csv_paths_all:
+    
+    # Hier wird die Auswahl aus der Dropbox-Tabelle verarbeitet.
+    # Wenn im Dropbox-Modus Dateien ausgewählt wurden, werden nur diese analysiert.
+    if mode == "Dropbox" and selected_paths:
+        selected_csvs = [os.path.join(workdir, os.path.basename(path)) for path in selected_paths]
+    else:
+        # Andernfalls, oder wenn keine Dateien ausgewählt wurden, werden alle gefundenen CSVs verarbeitet.
+        selected_csvs = [p for p in glob.glob(os.path.join(workdir,"**","*"), recursive=True)
+                         if os.path.isfile(p) and p.lower().endswith(".csv")]
+        
+    st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(selected_csvs)}")
+
+    if not selected_csvs:
         st.error("Keine CSVs gefunden. Lade Dateien und versuche es erneut.")
     else:
         tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
-        df = build_session_table_from_list(csv_paths_all, tmpdir, fs=fs if do_preproc else 0.0)
+        container = st.empty()
+        df = build_session_table_from_list(selected_csvs, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
         try: shutil.rmtree(tmpdir)
         except Exception: pass
 
         if df.empty:
             st.error("Keine gültigen Sessions mit Bandspalten gefunden.")
         else:
+            faa_list = []
+            for cp in selected_csvs:
+                faa = try_compute_faa_from_csv(cp)
+                if faa is not None:
+                    faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
+            faa_df = pd.DataFrame(faa_list)
+            
             if len(df)==1:
                 st.subheader("Einzel-Session")
                 st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
                 st.dataframe(df.round(4))
+                if not faa_df.empty:
+                    st.write("FAA (geschätzt) für einzelne Sessions:")
+                    st.dataframe(faa_df.round(4))
             else:
                 st.subheader("Stress/Entspannung")
                 st.plotly_chart(plot_stress_relax(df, smooth=smooth, outlier_z=outlier_z), use_container_width=True)
