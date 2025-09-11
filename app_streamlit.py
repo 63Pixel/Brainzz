@@ -208,7 +208,10 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
             status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
     if st_container is not None:
         progress.empty(); status_text.empty()
-    df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    df = df.dropna().sort_values("datetime").reset_index(drop=True)
     if not df.empty: df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
     return df
 
