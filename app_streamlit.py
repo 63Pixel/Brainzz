@@ -427,49 +427,7 @@ elif mode == "Dropbox":
                 files = []
 
             # Nur ZIP/CSV/SIP anzeigen
-            visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
-
-            # Checkbox-Auswahl (mit 'Alle auswählen')
-            st.session_state.setdefault("db_files_map", [])
-            st.session_state.setdefault("_select_all_applied", False)
-            st.session_state.setdefault("select_all_master", False)
-
-            if visible_files:
-                files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
-                st.session_state["db_files_map"] = files_map
-
-                st.checkbox("Alle auswählen", key="select_all_master")
-
-                if st.session_state["select_all_master"] != st.session_state["_select_all_applied"]:
-                    new_state = st.session_state["select_all_master"]
-                    for i in range(len(files_map)):
-                        st.session_state[f"chk_{i}"] = new_state
-                    st.session_state["_select_all_applied"] = new_state
-
-                selected_pairs = []
-                for i, (disp, remote) in enumerate(files_map):
-                    key = f"chk_{i}"
-                    val = st.session_state.get(key, False)
-                    st.session_state[key] = st.checkbox(disp, value=val, key=key)
-                    if st.session_state[key]:
-                        selected_pairs.append((disp, remote))
-
-                if st.button("Herunterladen ausgewählter Dateien"):
-                    if not selected_pairs:
-                        st.warning("Keine Datei ausgewählt.")
-                    else:
-                        downloaded = []
-                        for disp, remote in selected_pairs:
-                            try:
-                                lp = download_dropbox_file(token, remote, workdir)
-                                downloaded.append(lp)
-                            except Exception as e:
-                                st.error(f"Download fehlgeschlagen: {disp} — {e}")
-                        if downloaded:
-                            recursively_extract_archives(workdir)
-                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
-            else:
-                st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+           visible_files 
 
 
 
