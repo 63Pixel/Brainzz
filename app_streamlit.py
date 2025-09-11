@@ -38,7 +38,7 @@ def load_session_relatives(csv_path: str) -> pd.DataFrame | None:
     rel = pd.DataFrame(sums).replace([np.inf,-np.inf], np.nan).dropna()
     total = rel.sum(axis=1).replace(0, np.nan)
     rel = rel.div(total, axis=0).dropna()  # Zeilen normalisieren
-    return rel  # columns: delta,theta,alpha,beta,gamma
+    return rel
 
 def build_session_table(root_dir: str) -> pd.DataFrame:
     csvs = glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True)
@@ -68,14 +68,15 @@ def build_session_table(root_dir: str) -> pd.DataFrame:
 def rolling(series: pd.Series, win: int) -> pd.Series:
     return series.rolling(window=win, center=True, min_periods=1).mean()
 
+# ---------- Plotfunktionen ----------
 def plot_stress_relax(df: pd.DataFrame, smooth:int=5):
     df = df.copy()
     df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y")
-    fig, ax = plt.subplots(figsize=(12,5))
+    fig, ax = plt.subplots(figsize=(8,4))
     ax.scatter(df.index, df["stress"], color="red", s=60, alpha=0.6, label="Stress (Sessions)")
     ax.scatter(df.index, df["relax"],  color="green", s=60, alpha=0.6, label="Entspannung (Sessions)")
-    ax.plot(df.index, rolling(df["stress"], smooth), color="red", linewidth=3, label="Stress (Trend)")
-    ax.plot(df.index, rolling(df["relax"],  smooth), color="green", linewidth=3, label="Entspannung (Trend)")
+    ax.plot(df.index, rolling(df["stress"], smooth), color="red", linewidth=2.5, label="Stress (Trend)")
+    ax.plot(df.index, rolling(df["relax"],  smooth), color="green", linewidth=2.5, label="Entspannung (Trend)")
     uniq = df.drop_duplicates("date_str")
     ax.set_xticks(uniq.index); ax.set_xticklabels(uniq["date_str"], rotation=45, ha="right")
     ax.set_title("Stress- und Entspannungs-Index (ohne Lücken)")
@@ -95,9 +96,9 @@ def plot_bands(df: pd.DataFrame, smooth:int=5, with_ci: bool=True):
     colors = {"delta":"blue","theta":"purple","alpha":"green","beta":"orange","gamma":"gray",
               "stresswave":"darkorange","relaxwave":"turquoise"}
     styles = {"stresswave":":","relaxwave":":"}
-    fig, ax = plt.subplots(figsize=(12,5))
-    for c in ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]:
-        m = means[c].to_numpy(dtype=float); ax.plot(x, m, linewidth=3, label=c.capitalize(),
+    fig, ax = plt.subplots(figsize=(8,4))
+    for c in cols:
+        m = means[c].to_numpy(dtype=float); ax.plot(x, m, linewidth=2.5, label=c.capitalize(),
                                                     color=colors[c], linestyle=styles.get(c,"-"))
         if with_ci:
             s = stds[c].to_numpy(dtype=float); lo = np.clip(m - s, 0, 1); hi = np.clip(m + s, 0, 1)
@@ -109,6 +110,25 @@ def plot_bands(df: pd.DataFrame, smooth:int=5, with_ci: bool=True):
     fig.tight_layout()
     return fig
 
+def plot_single_session(df: pd.DataFrame):
+    vals = {
+        "Stress": df["stress"].iloc[0],
+        "Entspannung": df["relax"].iloc[0],
+        "Delta": df["delta"].iloc[0],
+        "Theta": df["theta"].iloc[0],
+        "Alpha": df["alpha"].iloc[0],
+        "Beta": df["beta"].iloc[0],
+        "Gamma": df["gamma"].iloc[0],
+    }
+    fig, ax = plt.subplots(figsize=(8,4))
+    ax.bar(vals.keys(), vals.values(), color=["red","green","blue","purple","green","orange","gray"])
+    ax.set_title("Einzel-Session Übersicht")
+    ax.set_ylabel("Wert")
+    plt.xticks(rotation=30)
+    fig.tight_layout()
+    return fig
+
+# ---------- Eingabe ----------
 st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP/Ordner als ZIP)", "FTP-Download"], horizontal=True)
 
@@ -122,7 +142,7 @@ if mode.startswith("Datei-Upload"):
             zf.extractall(workdir)
         st.success("ZIP entpackt.")
 elif mode.startswith("FTP"):
-    st.info("FTP nur unverschlüsselt (Standard-FTP). Für FTPS/SFTP erweitern.")
+    st.info("FTP nur unverschlüsselt (Standard-FTP).")
     host = st.text_input("FTP-Host", value="ftp.example.com")
     user = st.text_input("Benutzer", value="anonymous")
     pwd  = st.text_input("Passwort", value="", type="password")
@@ -134,14 +154,11 @@ elif mode.startswith("FTP"):
             ftp = FTP(host); ftp.login(user=user, passwd=pwd); ftp.cwd(remote_dir)
             names = ftp.nlst()
             targets = [n for n in names if pattern in n]
-            if not targets:
-                st.warning("Keine passenden Dateien gefunden.")
-            else:
-                for name in targets:
-                    loc = os.path.join(workdir, name)
-                    with open(loc, "wb") as f:
-                        ftp.retrbinary(f"RETR {name}", f.write)
-                st.success(f"{len(targets)} Datei(en) geladen.")
+            for name in targets:
+                loc = os.path.join(workdir, name)
+                with open(loc, "wb") as f:
+                    ftp.retrbinary(f"RETR {name}", f.write)
+            st.success(f"{len(targets)} Datei(en) geladen.")
             ftp.quit()
         except Exception as e:
             st.error(f"FTP-Fehler: {e}")
@@ -150,7 +167,6 @@ st.subheader("2) Parameter")
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
 
 if st.button("Auswertung starten"):
-    # Second-level ZIPs entpacken
     inner_zips = [os.path.join(workdir, f) for f in os.listdir(workdir) if f.lower().endswith(".zip")]
     for zp in inner_zips:
         name = os.path.splitext(os.path.basename(zp))[0]
@@ -165,21 +181,17 @@ if st.button("Auswertung starten"):
     if df.empty:
         st.error("Keine gültigen Sessions gefunden.")
     else:
-        fig1 = plot_stress_relax(df, smooth=smooth)
-        fig2 = plot_bands(df, smooth=smooth, with_ci=True)
+        if len(df) == 1:
+            st.subheader("Einzel-Session Analyse")
+            st.pyplot(plot_single_session(df), clear_figure=True, use_container_width=True)
+            st.dataframe(df.round(3))
+        else:
+            st.subheader("Stress/Entspannung (ohne Lücken)")
+            st.pyplot(plot_stress_relax(df, smooth=smooth), clear_figure=True, use_container_width=True)
+            st.subheader("Bänder + Stress-/Entspannungswellen")
+            st.pyplot(plot_bands(df, smooth=smooth, with_ci=True), clear_figure=True, use_container_width=True)
 
-        st.subheader("Stress/Entspannung (ohne Lücken)")
-        st.pyplot(fig1, clear_figure=True)
-        st.subheader("Bänder + Stress-/Entspannungswellen")
-        st.pyplot(fig2, clear_figure=True)
-
-        # Downloads
-        import io as _io
+        # Export
         df_out = df.copy(); df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
         st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
                            file_name="summary_indices.csv", mime="text/csv")
-        buf1, buf2 = _io.BytesIO(), _io.BytesIO()
-        fig1.savefig(buf1, format="png", dpi=160); buf1.seek(0)
-        fig2.savefig(buf2, format="png", dpi=160); buf2.seek(0)
-        st.download_button("Stress/Entspannung PNG", data=buf1, file_name="stress_relax_no_gaps.png", mime="image/png")
-        st.download_button("Bänder PNG", data=buf2, file_name="bands_with_waves.png", mime="image/png")
