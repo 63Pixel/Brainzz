@@ -5,4 +5,4 @@ plotly>=5.0.0
 dropbox>=11.0.0
 scipy
 paramiko
-streamlit-aggrid==0.4.5
+streamlit-aggrid==1.1.8.post1
