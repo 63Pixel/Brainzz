@@ -423,32 +423,12 @@ elif mode == "Dropbox":
             visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
             visible_files = sorted(visible_files, key=lambda x: x.name.lower())
 
-            # build DataFrame with description only shown
-            rows = []
-            for f in visible_files:
-                # date from filename if possible
-                dt = parse_dt_from_path(f.path_display)
-                dt_str = dt.strftime("%d-%m-%y %H:%M") if dt is not None else ""
-                size_kb = int(getattr(f, "size", 0) / 1024) if getattr(f, "size", None) is not None else None
-                size_str = f"{size_kb} KB" if size_kb is not None else ""
-                desc = f"{dt_str} · {size_str}" if dt_str or size_str else f"{f.name}"
-                rows.append({
-                    "description": desc,
-                    "path_display": f.path_display,
-                    "path_lower": f.path_lower,
-                    "dt": dt_str,
-                    "size_kb": size_kb
-                })
-            df_files = pd.DataFrame(rows)
-
-            # Try AgGrid first for compact table with checkbox-selection
             try:
                 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
                 if df_files.empty:
                     st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
                 else:
                     gb = GridOptionsBuilder.from_dataframe(df_files)
-                    # show only 'description' column; hide path columns but keep them for lookup
                     gb.configure_column("description", header_name="Datum · Größe", sortable=True, filter=True, resizable=True)
                     gb.configure_column("dt", header_name="Datum", hide=True)
                     gb.configure_column("size_kb", header_name="SizeKB", hide=True)
@@ -472,7 +452,6 @@ elif mode == "Dropbox":
                     selected = grid_response.get("selected_rows", [])
                     selected_paths = [r.get("path_lower") for r in selected] if selected else []
 
-                    # compact action bar
                     st.markdown("---")
                     c1, c2, c3 = st.columns([3,1,1])
                     with c1:
@@ -494,54 +473,21 @@ elif mode == "Dropbox":
                                     st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
                     with c3:
                         if st.button("Alle abwählen"):
-                            # trick: rerun to clear selection (AgGrid client-side selection cannot be cleared server-side reliably)
                             st.experimental_rerun()
 
             except Exception:
-                # fallback: compact multiselect with description labels
-                if df_files.empty:
-                    st.info("0 Datei(en) im Ordner.")
-                else:
-                    st.markdown("<small style='color:gray'>streamlit-aggrid nicht installiert. Fallback: kompakte Auswahl.</small>", unsafe_allow_html=True)
-                    options = df_files["description"].tolist()
-                    # map description->path_lower (may not be unique; prefer path_display if needed)
-                    map_desc_to_path = {row["description"] + f" [{i}]": row["path_lower"] for i,row in df_files.reset_index().to_dict(orient="index").items()}
-                    opts_display = list(map_desc_to_path.keys())
-                    sel = st.multiselect("Wähle Dateien (Beschreibung)", opts_display)
-                    if st.button("Herunterladen ausgewählter Dateien"):
-                        if not sel:
-                            st.warning("Keine Datei ausgewählt.")
-                        else:
-                            downloaded = []
-                            for key in sel:
-                                remote = map_desc_to_path.get(key)
-                                if not remote:
-                                    st.error(f"Interner Fehler: Pfad für {key} nicht gefunden.")
-                                    continue
-                                try:
-                                    lp = download_dropbox_file(token, remote, workdir)
-                                    downloaded.append(lp)
-                                except Exception as e:
-                                    st.error(f"Download fehlgeschlagen: {key} — {e}")
-                            if downloaded:
-                                recursively_extract_archives(workdir)
-                                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
-
-
+                st.error("Fehler beim Laden von streamlit-aggrid. Bitte stelle sicher, dass die Bibliothek korrekt installiert ist.")
 
 
 # ---------- Parameter / QC ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
-**Glättungsfenster (Sessions)**  
-- Sessions für Trend-Glättung. Empfehlung: 3–7.
+**Glättungsfenster (Sessions)** - Sessions für Trend-Glättung. Empfehlung: 3–7.
 
-**Outlier z-Schwelle**  
-- Markiert starke Ausreißer. Empfehlung: 2.5–3.5.
+**Outlier z-Schwelle** - Markiert starke Ausreißer. Empfehlung: 2.5–3.5.
 
-**Sampling-Rate (Hz)**  
-- Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass).
+**Sampling-Rate (Hz)** - Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass).
 """)
 
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
@@ -556,53 +502,11 @@ n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
 
-# ---------- Auswahl der Sessions ----------
-st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
-sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
-selected_csvs = csv_paths_all.copy()
-
-if sel_mode == "Letzte Tage":
-    days_opt = st.selectbox("Zeitraum", ["1 Tag","3 Tage","7 Tage","14 Tage"], index=2)
-    days_map = {"1 Tag":1, "3 Tage":3, "7 Tage":7, "14 Tage":14}
-    days = days_map[days_opt]
-    now = datetime.now()
-    selected = []
-    for p in csv_paths_all:
-        dt = parse_dt_from_path(p)
-        if dt is not None and dt >= (now - timedelta(days=days)):
-            selected.append(p)
-    selected_csvs = sorted(selected)
-    st.info(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
-
-elif sel_mode == "Letzte N Sessions":
-    parsed = [(p, parse_dt_from_path(p)) for p in csv_paths_all]
-    parsed = [t for t in parsed if t[1] is not None]
-    if not parsed:
-        st.warning("Keine mit Timestamp erkennbaren Sessions gefunden. Wähle 'Alle Sessions' oder 'Letzte Tage'.")
-        selected_csvs = []
-    else:
-        parsed_sorted = sorted(parsed, key=lambda x: x[1])
-        max_n = len(parsed_sorted)
-        default_n = min(30, max_n)
-        n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n, value=default_n, step=1)
-        selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
-        st.info(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
+# ---------- Session Auswahl aus AgGrid-Tabelle übernehmen ----------
+if mode == "Dropbox":
+    selected_csvs = [os.path.join(workdir, os.path.basename(path)) for path in selected_paths]
 else:
-    st.info(f"{len(selected_csvs)} Sessions (Alle)")
-
-limit_sessions = st.checkbox("Beschränke zusätzlich auf neueste N (beschleunigt)", value=False)
-if limit_sessions and len(selected_csvs)>0:
-    default_n2 = min(100, len(selected_csvs))
-    sel_n2 = st.number_input(f"Wenn aktiv: nur neueste N aus Auswahl (max {len(selected_csvs)})",
-                             min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
-    if sel_n2 < len(selected_csvs):
-        parsed2 = [(p, parse_dt_from_path(p)) for p in selected_csvs]
-        parsed2 = [t for t in parsed2 if t[1] is not None]
-        parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
-        selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
-        st.info(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2}).")
-
-st.info(f"{len(selected_csvs)} Sessions ausgewählt.")
+    selected_csvs = csv_paths_all
 
 # ---------- Auswertung ----------
 if st.button("Auswertung starten"):
