@@ -1,185 +1,408 @@
-import os, io, zipfile, glob, re, tempfile
-from datetime import datetime
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import streamlit as st
-from ftplib import FTP
+<!doctype html>
+<html lang="de" class="h-full">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>EEG‑Auswertung – Web UI</title>
+  <!-- Tailwind CSS (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = { darkMode: 'class' };
+  </script>
+  <!-- Plotly -->
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+  <!-- JSZip for reading .zip files in-browser -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+  <!-- Papa Parse for CSV -->
+  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <style>
+    html, body { height: 100%; }
+    .glass { backdrop-filter: saturate(150%) blur(14px); }
+    .mac-win { box-shadow: 0 10px 30px rgba(0,0,0,.08); }
+    .soft-shadow { box-shadow: 0 8px 24px rgba(2,6,23,.08); }
+    .ring-subtle { box-shadow: inset 0 0 0 1px rgba(148,163,184,.35); }
+  </style>
+</head>
+<body class="h-full bg-gradient-to-b from-slate-100 to-slate-50 dark:from-slate-950 dark:to-slate-900 text-slate-900 dark:text-slate-100 selection:bg-blue-200/60 dark:selection:bg-blue-400/30">
+  <div class="max-w-7xl mx-auto px-4 py-8 sm:py-12">
 
-st.set_page_config(page_title="EEG-Auswertung", layout="wide")
+    <!-- macOS window chrome -->
+    <div class="mac-win rounded-3xl overflow-hidden border border-slate-200/70 dark:border-slate-800/70 bg-white/70 dark:bg-slate-900/60 glass">
+      <div class="flex items-center justify-between px-4 sm:px-6 py-3 border-b border-slate-200/70 dark:border-slate-800/70 bg-white/60 dark:bg-slate-900/50">
+        <div class="flex items-center gap-3">
+          <div class="flex items-center gap-2">
+            <span class="inline-block w-3 h-3 rounded-full bg-red-500 ring-1 ring-red-600/40"></span>
+            <span class="inline-block w-3 h-3 rounded-full bg-yellow-400 ring-1 ring-yellow-500/40"></span>
+            <span class="inline-block w-3 h-3 rounded-full bg-green-500 ring-1 ring-green-600/40"></span>
+          </div>
+          <h1 class="text-base sm:text-lg font-semibold tracking-tight ml-3">EEG‑Auswertung</h1>
+        </div>
+        <div class="flex items-center gap-2">
+          <div class="inline-flex rounded-2xl overflow-hidden ring-1 ring-slate-300/70 dark:ring-slate-700/70">
+            <button id="themeLight" class="px-3 py-1.5 text-sm bg-white/80 dark:bg-transparent hover:bg-white dark:hover:bg-slate-800">Light</button>
+            <button id="themeDark" class="px-3 py-1.5 text-sm bg-transparent hover:bg-white/70 dark:hover:bg-slate-800">Dark</button>
+          </div>
+          <a id="downloadCsvBtn" class="px-3 py-1.5 text-sm rounded-2xl ring-1 ring-slate-300/70 dark:ring-slate-700/70 hover:bg-white/70 dark:hover:bg-slate-800" href="#" download="summary_indices.csv" hidden>CSV</a>
+          <button id="resetBtn" class="px-3 py-1.5 text-sm rounded-2xl ring-1 ring-slate-300/70 dark:ring-slate-700/70 hover:bg-white/70 dark:hover:bg-slate-800" type="button">Zurücksetzen</button>
+        </div>
+      </div>
 
-st.title("EEG-Auswertung im Browser")
-st.caption("Rohdaten → Bandanteile → Stress/Entspannung. Upload oder FTP-Download.")
+      <div class="p-4 sm:p-6">
+        <!-- Controls -->
+        <section class="rounded-2xl soft-shadow ring-subtle bg-white/70 dark:bg-slate-900/50 glass p-4 sm:p-6 mb-6">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+            <!-- File inputs -->
+            <div>
+              <h2 class="font-semibold mb-3">Datenquelle</h2>
+              <div class="space-y-3 text-sm">
+                <label class="block font-medium">ZIP mit Sessions</label>
+                <input id="zipInput" type="file" accept=".zip" class="block w-full text-sm file:mr-3 file:py-2 file:px-4 file:rounded-xl file:border-0 file:font-medium file:bg-slate-900 file:text-white hover:file:opacity-90 dark:file:bg-slate-100 dark:file:text-slate-900" />
+                <div class="text-center text-slate-500">oder</div>
+                <label class="block font-medium">Einzelne CSVs</label>
+                <input id="csvInput" type="file" accept=".csv" multiple class="block w-full text-sm" />
+              </div>
+            </div>
 
-# ---------- Hilfsfunktionen ----------
-PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
+            <!-- Options -->
+            <div>
+              <h2 class="font-semibold mb-3">Optionen</h2>
+              <div class="grid grid-cols-2 gap-3 text-sm">
+                <label class="inline-flex items-center gap-2"><input id="showTrend" type="checkbox" class="scale-110" checked> Trendlinien</label>
+                <label class="inline-flex items-center gap-2"><input id="absoluteIdx" type="checkbox" class="scale-110"> Absolute Indizes</label>
+                <label class="inline-flex items-center gap-2 col-span-2"><input id="groupDaily" type="checkbox" class="scale-110"> Pro Tag zusammenfassen</label>
+                <label class="col-span-2">Glättungsfenster
+                  <select id="smoothWin" class="mt-1 w-full rounded-xl border border-slate-300/80 dark:border-slate-700/80 bg-white/80 dark:bg-slate-900/60 px-3 py-2">
+                    <option>3</option>
+                    <option selected>5</option>
+                    <option>7</option>
+                    <option>9</option>
+                    <option>11</option>
+                  </select>
+                </label>
+              </div>
+            </div>
 
-def parse_dt_from_path(path: str):
-    m = PAT.search(path)
-    if not m:
-        return None
-    try:
-        return datetime.strptime(m.group(1), "%Y-%m-%d--%H-%M-%S")
-    except Exception:
-        return None
+            <!-- Actions -->
+            <div>
+              <h2 class="font-semibold mb-3">Aktion</h2>
+              <div class="flex flex-col gap-3">
+                <button id="analyzeBtn" class="inline-flex items-center justify-center gap-2 rounded-2xl px-4 py-2 font-medium bg-slate-900 text-white hover:opacity-90 dark:bg-white dark:text-slate-900" type="button">Auswertung starten</button>
+                <p id="status" class="text-sm text-slate-600 dark:text-slate-400"></p>
+              </div>
+            </div>
+          </div>
+        </section>
 
-def load_session_relatives(csv_path: str) -> pd.DataFrame | None:
-    try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception:
-        return None
-    bands = ["Delta","Theta","Alpha","Beta","Gamma"]
-    band_cols = {b:[c for c in df.columns if str(c).startswith(f"{b}_")] for b in bands}
-    if not all(len(band_cols[b])>0 for b in bands):
-        return None
-    sums = {}
-    for b in bands:
-        sums[b.lower()] = df[band_cols[b]].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-    rel = pd.DataFrame(sums).replace([np.inf,-np.inf], np.nan).dropna()
-    total = rel.sum(axis=1).replace(0, np.nan)
-    rel = rel.div(total, axis=0).dropna()  # Zeilen normalisieren
-    return rel  # columns: delta,theta,alpha,beta,gamma
+        <!-- Charts -->
+        <section class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <div class="rounded-2xl soft-shadow ring-subtle bg-white/70 dark:bg-slate-900/50 glass p-3 sm:p-4">
+            <div class="flex items-center justify-between px-1 pt-1 pb-2">
+              <h3 class="font-semibold">Stress & Entspannung</h3>
+              <button id="dlSR" class="px-3 py-1.5 text-xs rounded-xl ring-1 ring-slate-300/70 dark:ring-slate-700/70 hover:bg-white/70 dark:hover:bg-slate-800" type="button" hidden>PNG</button>
+            </div>
+            <div id="chartSR" class="w-full rounded-xl overflow-hidden" style="height:420px"></div>
+          </div>
+          <div class="rounded-2xl soft-shadow ring-subtle bg-white/70 dark:bg-slate-900/50 glass p-3 sm:p-4">
+            <div class="flex items-center justify-between px-1 pt-1 pb-2">
+              <h3 class="font-semibold">Bänder + Stress‑/Entspannungswellen</h3>
+              <button id="dlBands" class="px-3 py-1.5 text-xs rounded-xl ring-1 ring-slate-300/70 dark:ring-slate-700/70 hover:bg-white/70 dark:hover:bg-slate-800" type="button" hidden>PNG</button>
+            </div>
+            <div id="chartBands" class="w-full rounded-xl overflow-hidden" style="height:420px"></div>
+          </div>
+        </section>
 
-def build_session_table(root_dir: str) -> pd.DataFrame:
-    csvs = glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True)
-    rows = []
-    for cp in sorted(csvs):
-        dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
-        if dt is None:
-            continue
-        rel = load_session_relatives(cp)
-        if rel is None or rel.empty:
-            continue
-        alpha = rel["alpha"].mean()
-        beta  = rel["beta"].mean()
-        rows.append({
-            "datetime": dt,
-            "alpha": float(alpha),
-            "beta": float(beta),
-            "theta": float(rel["theta"].mean()),
-            "delta": float(rel["delta"].mean()),
-            "gamma": float(rel["gamma"].mean()),
-            "stress": float(beta/(alpha+1e-9)),
-            "relax":  float(alpha/(beta+1e-9)),
-        })
-    df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
-    return df
+        <!-- Table -->
+        <section class="rounded-2xl soft-shadow ring-subtle bg-white/70 dark:bg-slate-900/50 glass p-4 sm:p-6 mt-6">
+          <h3 class="font-semibold mb-3">Sessions</h3>
+          <div class="overflow-x-auto">
+            <table id="tbl" class="min-w-full text-sm">
+              <thead class="text-left text-slate-600 dark:text-slate-300">
+                <tr>
+                  <th class="py-2 pr-4">Zeit</th>
+                  <th class="py-2 pr-4">Delta</th>
+                  <th class="py-2 pr-4">Theta</th>
+                  <th class="py-2 pr-4">Alpha</th>
+                  <th class="py-2 pr-4">Beta</th>
+                  <th class="py-2 pr-4">Gamma</th>
+                  <th class="py-2 pr-4">Stress</th>
+                  <th class="py-2 pr-4">Entspannung</th>
+                  <th class="py-2 pr-4">VM/Abend</th>
+                </tr>
+              </thead>
+              <tbody id="tblBody" class="divide-y divide-slate-200 dark:divide-slate-800"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
 
-def rolling(series: pd.Series, win: int) -> pd.Series:
-    return series.rolling(window=win, center=True, min_periods=1).mean()
+<script>
+// ---------- Helpers ----------
+function getId(id){ return document.getElementById(id); }
+const root = document.documentElement;
+function status(msg){ getId('status').textContent = msg; }
+function fmt(n, d=3){ return (n===undefined||n===null||Number.isNaN(n)) ? '' : Number(n).toFixed(d); }
+function parseDateFromPath(p){
+  const m = /brainzz_([0-9]{4}-[0-9]{2}-[0-9]{2}--[0-9]{2}-[0-9]{2}-[0-9]{2})/i.exec(p);
+  if(!m) return null;
+  const parts = m[1].split('--');
+  const [Y, M, D] = parts[0].split('-').map(Number);
+  const [h, mi, se] = parts[1].split('-').map(Number);
+  return new Date(Date.UTC(Y, M-1, D, h, mi, se));
+}
+function toTTMMJJ(dt){
+  const dd = String(dt.getUTCDate()).padStart(2,'0');
+  const mm = String(dt.getUTCMonth()+1).padStart(2,'0');
+  const yy = String(dt.getUTCFullYear()).slice(-2);
+  const HH = String(dt.getUTCHours()).padStart(2,'0');
+  const MM = String(dt.getUTCMinutes()).padStart(2,'0');
+  return `${dd}-${mm}-${yy} ${HH}:${MM}`;
+}
+function movingAverage(arr, key, w){
+  const n = arr.length; const out = new Array(n).fill(null);
+  for(let i=0;i<n;i++){
+    let s=0, c=0;
+    for(let j=i-Math.floor(w/2); j<=i+Math.floor(w/2); j++){
+      if(j>=0 && j<n){ s += arr[j][key]; c++; }
+    }
+    out[i] = (c>0) ? s/c : null;
+  }
+  return out;
+}
 
-def plot_stress_relax(df: pd.DataFrame, smooth:int=5):
-    df = df.copy()
-    df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y")
-    fig, ax = plt.subplots(figsize=(12,5))
-    ax.scatter(df.index, df["stress"], color="red", s=60, alpha=0.6, label="Stress (Sessions)")
-    ax.scatter(df.index, df["relax"],  color="green", s=60, alpha=0.6, label="Entspannung (Sessions)")
-    ax.plot(df.index, rolling(df["stress"], smooth), color="red", linewidth=3, label="Stress (Trend)")
-    ax.plot(df.index, rolling(df["relax"],  smooth), color="green", linewidth=3, label="Entspannung (Trend)")
-    uniq = df.drop_duplicates("date_str")
-    ax.set_xticks(uniq.index); ax.set_xticklabels(uniq["date_str"], rotation=45, ha="right")
-    ax.set_title("Stress- und Entspannungs-Index (ohne Lücken)")
-    ax.set_xlabel("Datum"); ax.set_ylabel("Indexwert"); ax.grid(True, alpha=0.3); ax.legend()
-    fig.tight_layout()
-    return fig
+// ---------- Readers ----------
+async function readZip(file){
+  const zip = await JSZip.loadAsync(file);
+  const entries = [];
+  await Promise.all(Object.keys(zip.files).map(async name => {
+    if(!name.toLowerCase().endsWith('.csv')) return;
+    const txt = await zip.files[name].async('string');
+    entries.push({ name, text: txt });
+  }));
+  return entries;
+}
+async function readCsvFiles(fileList){
+  const entries = [];
+  for(const f of fileList){
+    const txt = await f.text();
+    entries.push({ name: f.name, text: txt });
+  }
+  return entries;
+}
+function parseCsvText(text){
+  const res = Papa.parse(text, { header: true, dynamicTyping: true, skipEmptyLines: true });
+  return res.data;
+}
 
-def plot_bands(df: pd.DataFrame, smooth:int=5, with_ci: bool=True):
-    d = df.copy()
-    d["stresswave"] = d["beta"] + d["gamma"]
-    d["relaxwave"]  = d["alpha"] + d["theta"]
-    d["date_str"] = d["datetime"].dt.strftime("%d-%m-%y")
-    cols = ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]
-    means = {c: rolling(d[c], smooth) for c in cols}
-    stds  = {c: d[c].rolling(window=smooth, center=True, min_periods=1).std().fillna(0.0) for c in cols}
-    x = np.arange(len(d))
-    colors = {"delta":"blue","theta":"purple","alpha":"green","beta":"orange","gamma":"gray",
-              "stresswave":"darkorange","relaxwave":"turquoise"}
-    styles = {"stresswave":":","relaxwave":":"}
-    fig, ax = plt.subplots(figsize=(12,5))
-    for c in ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]:
-        m = means[c].to_numpy(dtype=float); ax.plot(x, m, linewidth=3, label=c.capitalize(),
-                                                    color=colors[c], linestyle=styles.get(c,"-"))
-        if with_ci:
-            s = stds[c].to_numpy(dtype=float); lo = np.clip(m - s, 0, 1); hi = np.clip(m + s, 0, 1)
-            ax.fill_between(x, lo, hi, alpha=0.15, color=colors[c])
-    uniq = d.drop_duplicates("date_str")
-    ax.set_xticks(uniq.index); ax.set_xticklabels(uniq["date_str"], rotation=45, ha="right")
-    ax.set_title("EEG-Bandanteile mit Stress-/Entspannungswellen")
-    ax.set_xlabel("Datum"); ax.set_ylabel("Relativer Anteil"); ax.set_ylim(0,1); ax.grid(True, alpha=0.3); ax.legend(ncol=3)
-    fig.tight_layout()
-    return fig
+// ---------- Compute ----------
+function computeSessionFromRows(rows, name){
+  const bands = ['Delta','Theta','Alpha','Beta','Gamma'];
+  const sums = { delta: [], theta: [], alpha: [], beta: [], gamma: [] };
+  if(!rows || rows.length===0) return null;
+  const cols = Object.keys(rows[0] ?? {});
+  for(const row of rows){
+    let vals = {delta:0,theta:0,alpha:0,beta:0,gamma:0};
+    for(const c of cols){
+      for(const B of bands){
+        if(String(c).startsWith(B+'_')){
+          const v = Number(row[c]);
+          if(Number.isFinite(v)) vals[B.toLowerCase()] += v;
+        }
+      }
+    }
+    const total = vals.delta+vals.theta+vals.alpha+vals.beta+vals.gamma;
+    if(total>0){
+      sums.delta.push(vals.delta/total);
+      sums.theta.push(vals.theta/total);
+      sums.alpha.push(vals.alpha/total);
+      sums.beta.push(vals.beta/total);
+      sums.gamma.push(vals.gamma/total);
+    }
+  }
+  if(sums.alpha.length===0) return null;
+  const mean = k => sums[k].reduce((a,b)=>a+b,0)/sums[k].length;
+  const alpha = mean('alpha');
+  const beta  = mean('beta');
+  const theta = mean('theta');
+  const delta = mean('delta');
+  const gamma = mean('gamma');
+  const dt = parseDateFromPath(name);
+  if(!dt) return null;
+  const stress = beta/(alpha+1e-9);
+  const relax  = alpha/(beta+1e-9);
+  const tod = (dt.getUTCHours()<15)? 'Vormittag':'Abend';
+  return { dt, date_str: toTTMMJJ(dt), alpha, beta, theta, delta, gamma, stress, relax, tod };
+}
+function buildSummary(sessions, groupDaily){
+  const data = [...sessions].sort((a,b)=>a.dt-b.dt);
+  if(!groupDaily) return data;
+  const map = new Map();
+  for(const s of data){
+    const key = s.date_str.slice(0,8);
+    if(!map.has(key)) map.set(key, []);
+    map.get(key).push(s);
+  }
+  const out = [];
+  for(const [key, arr] of map){
+    const avg = f => arr.reduce((a,b)=>a+b[f],0)/arr.length;
+    out.push({
+      dt: arr[0].dt,
+      date_str: key,
+      alpha: avg('alpha'), beta: avg('beta'), theta: avg('theta'), delta: avg('delta'), gamma: avg('gamma'),
+      stress: avg('stress'), relax: avg('relax'), tod: ''
+    });
+  }
+  return out.sort((a,b)=>a.dt-b.dt);
+}
 
-st.subheader("1) Datenquelle wählen")
-mode = st.radio("Quelle", ["Datei-Upload (ZIP/Ordner als ZIP)", "FTP-Download"], horizontal=True)
+// ---------- Plot ----------
+function plotTemplate(){ return root.classList.contains('dark') ? 'plotly_dark' : 'plotly'; }
+function relayoutTemplate(id){ Plotly.relayout(getId(id), {template: plotTemplate(), paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(0,0,0,0)'}); }
 
-workdir = tempfile.mkdtemp(prefix="eeg_works_")
+function drawStressRelax(summary, showTrend, absolute, win){
+  const x = summary.map(s=>s.date_str);
+  const stress = absolute? summary.map(s=> s.beta/(s.alpha+1e-9)) : summary.map(s=> s.stress);
+  const relax  = absolute? summary.map(s=> s.alpha/(s.beta+1e-9)) : summary.map(s=> s.relax);
+  const trendS = showTrend? movingAverage(summary.map((v,i)=>({val:stress[i]})).map(o=>({val:o.val})), 'val', win) : [];
+  const trendR = showTrend? movingAverage(summary.map((v,i)=>({val:relax[i]})).map(o=>({val:o.val})), 'val', win) : [];
 
-if mode.startswith("Datei-Upload"):
-    up = st.file_uploader("ZIP-Datei hochladen", type=["zip"])
-    if up is not None:
-        zbytes = up.read()
-        with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
-            zf.extractall(workdir)
-        st.success("ZIP entpackt.")
-elif mode.startswith("FTP"):
-    st.info("FTP nur unverschlüsselt (Standard-FTP). Für FTPS/SFTP erweitern.")
-    host = st.text_input("FTP-Host", value="ftp.example.com")
-    user = st.text_input("Benutzer", value="anonymous")
-    pwd  = st.text_input("Passwort", value="", type="password")
-    remote_dir = st.text_input("Remote-Pfad", value="/")
-    pattern = st.text_input("Dateimuster (z. B. .zip)", value=".zip")
-    go = st.button("Vom FTP laden")
-    if go:
-        try:
-            ftp = FTP(host); ftp.login(user=user, passwd=pwd); ftp.cwd(remote_dir)
-            names = ftp.nlst()
-            targets = [n for n in names if pattern in n]
-            if not targets:
-                st.warning("Keine passenden Dateien gefunden.")
-            else:
-                for name in targets:
-                    loc = os.path.join(workdir, name)
-                    with open(loc, "wb") as f:
-                        ftp.retrbinary(f"RETR {name}", f.write)
-                st.success(f"{len(targets)} Datei(en) geladen.")
-            ftp.quit()
-        except Exception as e:
-            st.error(f"FTP-Fehler: {e}")
+  const traces = [
+    { x, y: stress, type:'scatter', mode:'lines+markers', name:'Stress', line:{color:'rgb(239,68,68)'}, marker:{size:6} },
+    { x, y: relax,  type:'scatter', mode:'lines+markers', name:'Entspannung', line:{color:'rgb(34,197,94)'}, marker:{size:6} }
+  ];
+  if(showTrend){
+    traces.push({ x, y: trendS, type:'scatter', mode:'lines', name:'Stress (Trend)', line:{color:'rgb(239,68,68)', dash:'dash'} });
+    traces.push({ x, y: trendR, type:'scatter', mode:'lines', name:'Entspannung (Trend)', line:{color:'rgb(34,197,94)', dash:'dash'} });
+  }
+  const layout = {
+    title: {text:'Stress‑ & Entspannungs‑Index', x:0, xanchor:'left', font:{size:16}},
+    xaxis: { type:'category' },
+    margin:{l:40,r:24,t:40,b:40},
+    template: plotTemplate(),
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(0,0,0,0)'
+  };
+  Plotly.newPlot('chartSR', traces, layout, {responsive:true, displaylogo:false, modeBarButtonsToRemove:['lasso2d','select2d']});
+  relayoutTemplate('chartSR');
+  getId('dlSR').hidden = false;
+}
 
-st.subheader("2) Parameter")
-smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
+function drawBands(summary, win){
+  const x = summary.map(s=>s.date_str);
+  const series = {
+    Delta: summary.map(s=>s.delta),
+    Theta: summary.map(s=>s.theta),
+    Alpha: summary.map(s=>s.alpha),
+    Beta:  summary.map(s=>s.beta),
+    Gamma: summary.map(s=>s.gamma),
+    'Stress‑Welle (Beta+Gamma)': summary.map(s=> s.beta + s.gamma),
+    'Entspannungs‑Welle (Alpha+Theta)': summary.map(s=> s.alpha + s.theta),
+  };
+  const traces = Object.entries(series).map(([name, y])=>({ x, y, type:'scatter', mode:'lines+markers', name, marker:{size:6} }));
+  const layout = {
+    title: {text:'Bänder + Stress/Entspannungs‑Wellen', x:0, xanchor:'left', font:{size:16}},
+    xaxis: { type:'category' }, yaxis: { range:[0,1] },
+    margin:{l:40,r:24,t:40,b:40},
+    template: plotTemplate(),
+    paper_bgcolor: 'rgba(0,0,0,0)',
+    plot_bgcolor: 'rgba(0,0,0,0)'
+  };
+  Plotly.newPlot('chartBands', traces, layout, {responsive:true, displaylogo:false, modeBarButtonsToRemove:['lasso2d','select2d']});
+  relayoutTemplate('chartBands');
+  getId('dlBands').hidden = false;
+}
 
-if st.button("Auswertung starten"):
-    # Second-level ZIPs entpacken
-    inner_zips = [os.path.join(workdir, f) for f in os.listdir(workdir) if f.lower().endswith(".zip")]
-    for zp in inner_zips:
-        name = os.path.splitext(os.path.basename(zp))[0]
-        out = os.path.join(workdir, name); os.makedirs(out, exist_ok=True)
-        try:
-            with zipfile.ZipFile(zp, "r") as zf:
-                zf.extractall(out)
-        except zipfile.BadZipFile:
-            pass
+function populateTable(summary){
+  const body = getId('tblBody');
+  body.innerHTML = '';
+  for(const s of summary){
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td class="py-2 pr-4">${s.date_str}</td>
+      <td class="py-2 pr-4">${fmt(s.delta)}</td>
+      <td class="py-2 pr-4">${fmt(s.theta)}</td>
+      <td class="py-2 pr-4">${fmt(s.alpha)}</td>
+      <td class="py-2 pr-4">${fmt(s.beta)}</td>
+      <td class="py-2 pr-4">${fmt(s.gamma)}</td>
+      <td class="py-2 pr-4">${fmt(s.stress)}</td>
+      <td class="py-2 pr-4">${fmt(s.relax)}</td>
+      <td class="py-2 pr-4">${s.tod||''}</td>
+    `;
+    body.appendChild(tr);
+  }
+}
 
-    df = build_session_table(workdir)
-    if df.empty:
-        st.error("Keine gültigen Sessions gefunden.")
-    else:
-        fig1 = plot_stress_relax(df, smooth=smooth)
-        fig2 = plot_bands(df, smooth=smooth, with_ci=True)
+function buildCsv(summary){
+  const headers = ['datetime','date_str','delta','theta','alpha','beta','gamma','stress','relax','tod'];
+  const rows = summary.map(s=>[
+    s.dt.toISOString(), s.date_str, s.delta, s.theta, s.alpha, s.beta, s.gamma, s.stress, s.relax, s.tod
+  ]);
+  const csv = [headers.join(','), ...rows.map(r=>r.join(','))].join('
+');
+  const blob = new Blob([csv], {type:'text/csv'});
+  const url = URL.createObjectURL(blob);
+  const a = getId('downloadCsvBtn');
+  a.href = url; a.hidden = false;
+}
 
-        st.subheader("Stress/Entspannung (ohne Lücken)")
-        st.pyplot(fig1, clear_figure=True)
-        st.subheader("Bänder + Stress-/Entspannungswellen")
-        st.pyplot(fig2, clear_figure=True)
+function recolorPlots(){
+  ['chartSR','chartBands'].forEach(id => { try { relayoutTemplate(id); } catch(e){} });
+}
 
-        # Downloads
-        import io as _io
-        df_out = df.copy(); df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
-                           file_name="summary_indices.csv", mime="text/csv")
-        buf1, buf2 = _io.BytesIO(), _io.BytesIO()
-        fig1.savefig(buf1, format="png", dpi=160); buf1.seek(0)
-        fig2.savefig(buf2, format="png", dpi=160); buf2.seek(0)
-        st.download_button("Stress/Entspannung PNG", data=buf1, file_name="stress_relax_no_gaps.png", mime="image/png")
-        st.download_button("Bänder PNG", data=buf2, file_name="bands_with_waves.png", mime="image/png")
+// ---------- Wire up ----------
+function setTheme(mode){
+  if(mode === 'dark') root.classList.add('dark');
+  else root.classList.remove('dark');
+  recolorPlots();
+}
+getId('themeLight').addEventListener('click', () => setTheme('light'));
+getId('themeDark').addEventListener('click', () => setTheme('dark'));
+if(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches){ setTheme('dark'); }
+
+getId('resetBtn').addEventListener('click', () => window.location.reload());
+
+getId('analyzeBtn').addEventListener('click', async () => {
+  try{
+    status('Lese Daten …');
+    const zipFile = getId('zipInput').files[0] || null;
+    const csvFiles = getId('csvInput').files || null;
+
+    let entries = [];
+    if(zipFile){ entries = await readZip(zipFile); }
+    if(csvFiles && csvFiles.length){
+      const e2 = await readCsvFiles(csvFiles);
+      entries = entries.concat(e2);
+    }
+    if(entries.length===0){ status('Keine Dateien gefunden.'); return; }
+
+    const sessions = [];
+    for(const {name, text} of entries){
+      const rows = parseCsvText(text);
+      const sess = computeSessionFromRows(rows, name);
+      if(sess) sessions.push(sess);
+    }
+    if(sessions.length===0){ status('Keine gültigen Sessions ermittelt.'); return; }
+
+    const groupDaily = getId('groupDaily').checked;
+    const absolute = getId('absoluteIdx').checked;
+    const showTrend = getId('showTrend').checked;
+    const win = parseInt(getId('smoothWin').value, 10);
+
+    const summary = buildSummary(sessions, groupDaily);
+    drawStressRelax(summary, showTrend, absolute, win);
+    drawBands(summary, win);
+    populateTable(summary);
+    buildCsv(summary);
+    status(`${summary.length} Session(s) verarbeitet.`);
+
+    getId('dlSR').onclick = () => Plotly.downloadImage(getId('chartSR'), {format:'png', filename:'stress_relax'});
+    getId('dlBands').onclick = () => Plotly.downloadImage(getId('chartBands'), {format:'png', filename:'bands'});
+  }catch(e){
+    console.error(e);
+    status('Fehler: '+e.message);
+  }
+});
+</script>
+</body>
+</html>
