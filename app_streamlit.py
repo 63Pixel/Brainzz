@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App - Rekursive Extraktion + UI-Fixes
-Replace your current app_streamlit.py with this file.
+EEG-Auswertung Streamlit App
+- Rekursive Extraktion (.zip/.sip)
+- Kategorie-X-Achsen Plotly
+- Hilfe-Expander standardmäßig eingeklappt
+- "Alle Sessions" Ansicht: Hervorhebung letzter Tage / neueste N (Badges)
+- Keine Debug-Ausgaben / keine SciPy/Paramiko-Statuszeile
 """
 import os
 import io
@@ -33,8 +37,20 @@ except Exception:
     HAS_SCIPY = False
 
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
+
+# --- CSS für Badges ---
+st.markdown("""
+<style>
+.badge{display:inline-block;padding:4px 8px;border-radius:8px;color:#fff;font-size:12px;margin-right:8px}
+.badge-recent{background:#ff8c00}
+.badge-newest{background:#28a745}
+.badge-both{background:#6f42c1}
+.session-row{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
+</style>
+""", unsafe_allow_html=True)
+
 st.title("EEG-Auswertung")
-st.caption("Interaktive Auswertung. Wähle ZIP/FTP/SFTP, dann Sessions und Parameter.")
+st.caption("Interaktive Auswertung. ZIP/FTP/SFTP hochladen, Sessions auswählen, Analyse starten.")
 
 # Regex to parse filename timestamps like: brainzz_2025-09-05--09-47-44
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
@@ -173,7 +189,7 @@ def try_compute_faa_from_csv(csv_path):
         return np.log(right+1e-9) - np.log(left+1e-9)
     return None
 
-# Plot helpers (Plotly)
+# --- Plot helpers (Plotly) ---
 def plot_single_session_interactive(df):
     vals = {
         "Stress": df["stress"].iloc[0],
@@ -232,14 +248,9 @@ def plot_bands(df, smooth=5):
 
 # ---------------- helper: recursive extraction of nested archives ----------------
 def recursively_extract_archives(root_dir):
-    """
-    Extract .zip and .sip files recursively. After extracting an archive,
-    rename it with suffix '.extracted' to avoid reprocessing.
-    """
     changed = True
     while changed:
         changed = False
-        # find archives case-insensitive
         archives = [p for p in glob.glob(os.path.join(root_dir, "**", "*"), recursive=True)
                     if os.path.isfile(p) and p.lower().endswith(('.zip', '.sip'))]
         for arch in archives:
@@ -253,14 +264,12 @@ def recursively_extract_archives(root_dir):
                 try:
                     os.rename(arch, arch + ".extracted")
                 except Exception:
-                    # if rename fails, remove the archive to avoid re-extraction (destructive)
                     try:
                         os.remove(arch)
                     except Exception:
                         pass
                 changed = True
             except zipfile.BadZipFile:
-                # not a zip-like archive or corrupted; skip
                 continue
             except Exception:
                 continue
@@ -272,13 +281,12 @@ mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
 
 if mode.startswith("Datei-Upload"):
-    up = st.file_uploader("ZIP-Datei hochladen (pack das Paket mit CSVs/SIPs)", type=["zip"])
+    up = st.file_uploader("ZIP-Datei hochladen (Paket mit CSVs/SIPs)", type=["zip"])
     if up is not None:
         zbytes = up.read()
         try:
             with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
                 zf.extractall(workdir)
-            # recursively extract nested SIP/ZIPs
             recursively_extract_archives(workdir)
             st.success("ZIP entpackt und verschachtelte Archive extrahiert.")
         except Exception as e:
@@ -302,7 +310,6 @@ elif mode.startswith("FTP"):
                 loc = os.path.join(workdir, name)
                 with open(loc, "wb") as f:
                     ftp.retrbinary("RETR " + name, f.write)
-            # extract and recursively extract nested
             recursively_extract_archives(workdir)
             st.success(f"{len(targets)} Datei(en) geladen und Archive extrahiert.")
             ftp.quit()
@@ -339,7 +346,7 @@ elif mode.startswith("SFTP"):
 
 # ---------- Parameters / QC ----------
 st.subheader("2) Parameter / QC")
-with st.expander("Hilfe zu Parametern", expanded=True):
+with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
 **Glättungsfenster (Sessions)**  
 - Anzahl Sessions für die Trend-Glättung. Größer = glatter, kleiner = detailreicher. Empfehlung: 3–7.
@@ -353,6 +360,9 @@ with st.expander("Hilfe zu Parametern", expanded=True):
 **Preprocessing**  
 - Notch entfernt Netzstörungen (50/60 Hz). Bandpass begrenzt auf 0.5–45 Hz.
 - Nur aktivieren wenn CSV Rohzeitreihen enthält. SciPy benötigt.
+
+**Was sind "Endsessions"?**  
+- "Endsessions" = die neuesten N Sessions. Das sind die zuletzt aufgezeichneten Messungen nach Timestamp.
 """)
 
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
@@ -403,9 +413,53 @@ elif sel_mode == "Letzte N Sessions":
         n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n, value=default_n, step=1)
         selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
         st.write(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
+
 else:
+    # Alle Sessions: show count and offer highlight config
     st.write(f"{len(selected_csvs)} Sessions (Alle)")
 
+    with st.expander("Hervorhebung einstellen (letzte Tage / neueste N)", expanded=False):
+        days_opt2 = st.selectbox("Markiere Sessions der letzten Tage (Keine = aus)",
+                                ["Keine", "1 Tag", "3 Tage", "7 Tage", "14 Tage"], index=0)
+        days_map2 = {"Keine": 0, "1 Tag":1, "3 Tage":3, "7 Tage":7, "14 Tage":14}
+        highlight_days = days_map2[days_opt2]
+
+        if n_csv > 0:
+            highlight_newest_n = st.number_input("Markiere neueste N Sessions (0 = aus)",
+                                                min_value=0, max_value=n_csv, value=0, step=1)
+        else:
+            highlight_newest_n = 0
+            st.write("Keine CSVs gefunden, daher keine Markierung möglich.")
+
+    # compute highlight sets
+    recent_set = set()
+    newest_set = set()
+    if highlight_days and highlight_days > 0:
+        now = datetime.now()
+        for p in selected_csvs:
+            dt = parse_dt_from_path(p)
+            if dt is not None and dt >= (now - timedelta(days=highlight_days)):
+                recent_set.add(os.path.basename(p))
+    if highlight_newest_n and highlight_newest_n > 0:
+        parsed = [(p, parse_dt_from_path(p)) for p in selected_csvs]
+        parsed = [t for t in parsed if t[1] is not None]
+        parsed_sorted = sorted(parsed, key=lambda x: x[1])
+        newest = [os.path.basename(p) for p,_ in parsed_sorted[-int(highlight_newest_n):]]
+        newest_set.update(newest)
+
+    st.write("Sessions (Vorschau):")
+    for p in sorted(selected_csvs):
+        b = os.path.basename(p)
+        badge_html = ""
+        if b in recent_set and b in newest_set:
+            badge_html = "<span class='badge badge-both'>beide</span>"
+        elif b in recent_set:
+            badge_html = "<span class='badge badge-recent'>letzte Tage</span>"
+        elif b in newest_set:
+            badge_html = "<span class='badge badge-newest'>neueste N</span>"
+        st.markdown(f"<div class='session-row'>{badge_html}{b}</div>", unsafe_allow_html=True)
+
+# optional limiter for large selections
 limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
@@ -418,19 +472,10 @@ if limit_sessions and len(selected_csvs)>0:
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
         st.write(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
 
-# preview selected
-if selected_csvs:
-    st.write("Preview der auszuwertenden Sessions (erste 20):")
-    st.write([os.path.basename(p) for p in selected_csvs[:20]])
-else:
-    st.info("Keine Sessions ausgewählt.")
-
 # ---------------- Run analysis ----------------
 if st.button("Auswertung starten"):
-    # unpack any inner zips in workdir (uploaded or downloaded)
     recursively_extract_archives(workdir)
 
-    # refresh csv list and resolve selection by basename
     csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                      if os.path.isfile(p) and p.lower().endswith(".csv")]
     csv_paths_all = sorted(csv_paths_all)
@@ -447,7 +492,7 @@ if st.button("Auswertung starten"):
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
 
     if len(resolved_selected) == 0:
-        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Arbeitsverzeichnis oder lade das ZIP neu hoch.")
+        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Paket oder lade das ZIP neu hoch.")
     else:
         tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
         container = st.empty()
