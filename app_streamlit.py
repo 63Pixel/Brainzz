@@ -90,30 +90,55 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     proc.to_csv(outp, index=False)
     return outp, True
 
-def load_session_relatives(csv_path):
-    try: df = pd.read_csv(csv_path, low_memory=False)
-    except Exception: return None
-    bands = ["Delta","Theta","Alpha","Beta","Gamma"]
-    cols = {b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else []) for b in bands}
-    if not all(cols[b] for b in bands): return None
-    sums = {}
-    for b in bands:
-        try: sums[b.lower()] = df[cols[b]].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-        except Exception: return None
-    rel = pd.DataFrame(sums).replace([np.inf,-np.inf], np.nan).dropna()
-    tot = rel.sum(axis=1).replace(0,np.nan)
-    return rel.div(tot, axis=0).dropna()
+def load_csv(path):
+    """
+    Lädt eine CSV-Datei und überspringt fehlerhafte Zeilen, die Probleme verursachen.
+    """
+    try:
+        # read_csv mit error_bad_lines=False, um problematische Zeilen zu ignorieren
+        df = pd.read_csv(path, sep=',', on_bad_lines='skip')
+        # Bereinigen von Spaltennamen (entfernen von Leerzeichen)
+        df.columns = df.columns.str.strip()
+        # Stellen Sie sicher, dass die "TimeStamp"-Spalte vorhanden ist
+        if 'TimeStamp' in df.columns:
+            df['datetime'] = pd.to_datetime(df['TimeStamp'], errors='coerce')
+        return df
+    except Exception as e:
+        st.error(f"Fehler beim Laden von {os.path.basename(path)}: {e}")
+        return None
 
-def try_compute_faa_from_csv(csv_path):
-    try: df = pd.read_csv(csv_path, low_memory=False)
-    except Exception: return None
-    L = [k for k in df.columns if "alpha" in k.lower() and any(tag in k.lower() for tag in ["left","fp1","f3"])]
-    R = [k for k in df.columns if "alpha" in k.lower() and any(tag in k.lower() for tag in ["right","fp2","f4"])]
-    if L and R:
-        left = df[L].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        right= df[R].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        return np.log(right+1e-9)-np.log(left+1e-9)
-    return None
+def try_compute_faa_from_csv(path):
+    """
+    Versucht, den Frontal Alpha Asymmetry (FAA)-Wert aus einer CSV-Datei zu berechnen.
+    """
+    df = load_csv(path)
+    if df is None:
+        return None
+
+    # Suchen Sie nach Spaltennamen, die mit Alpha beginnen, um linke und rechte Alpha-Werte zu finden
+    alpha_cols = [c for c in df.columns if 'Alpha' in c]
+    if not alpha_cols:
+        st.warning(f"Keine Alpha-Spalten in {os.path.basename(path)} gefunden. FAA kann nicht berechnet werden.")
+        return None
+    
+    # Vereinfachte Annahme: Wir finden die ersten beiden Alpha-Spalten, die linke und rechte Hemisphäre repräsentieren könnten
+    # In einem komplexeren Fall wäre eine Zuordnung von Kanälen erforderlich
+    if len(alpha_cols) < 2:
+        st.warning(f"Nicht genug Alpha-Spalten in {os.path.basename(path)} für FAA-Berechnung gefunden.")
+        return None
+        
+    alpha_left = df[alpha_cols[0]]
+    alpha_right = df[alpha_cols[1]]
+    
+    # Vermeiden Sie eine Division durch Null und behandeln Sie leere oder NaN-Werte
+    if alpha_left.isnull().all() or alpha_right.isnull().all():
+        st.warning(f"Alpha-Spalten in {os.path.basename(path)} enthalten nur leere Werte. FAA kann nicht berechnet werden.")
+        return None
+
+    alpha_left_avg = np.log(alpha_left.mean())
+    alpha_right_avg = np.log(alpha_right.mean())
+    faa = alpha_right_avg - alpha_left_avg
+    return faa
 
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
