@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App - Version mit Quick-Wins + Data-QC
-Features added:
-- Plotly interactive plots with hovertemplates and category x-axis
-- Smaller responsive charts (use_container_width=True)
-- Einzel-Session: interaktives Balkendiagramm
-- Outlier detection (z-score) and marking of outliers in plots
-- FAA calculation if left/right alpha present
-- Optional basic preprocessing (notch + bandpass) if raw time-series columns exist in CSV
-- Optional SFTP support (paramiko)
-Notes:
-- If CSVs only contain band-power columns (Delta_..., Alpha_...), preprocessing is skipped.
-- Save this file as app_streamlit_v2.py and deploy as before.
+EEG-Auswertung Streamlit App - Version v3
+Adds:
+- Auto-disable heavy preprocessing for large total CSV size
+- Progress bar during processing
+- Option to limit processing to newest N sessions
+Save as app_streamlit_v3.py and deploy like before.
 """
 
-import os, io, zipfile, glob, re, tempfile
+import os, io, zipfile, glob, re, tempfile, shutil
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -31,17 +25,16 @@ try:
 except Exception:
     HAS_PARAMIKO = False
 
-# Signal processing
+# Signal processing availability
 try:
     from scipy.signal import iirnotch, butter, filtfilt
     HAS_SCIPY = True
 except Exception:
     HAS_SCIPY = False
 
-st.set_page_config(page_title="EEG-Auswertung (v2)", layout="wide")
-
-st.title("EEG-Auswertung — Quick‑Wins & Data‑QC")
-st.caption("Interaktive Plots. QC: Notch/Bandpass (wenn Rohdaten vorhanden), Outlier‑Markierung, FAA.")
+st.set_page_config(page_title="EEG-Auswertung (v3)", layout="wide")
+st.title("EEG-Auswertung — v3 (Performance & QC)")
+st.caption("Automatische Beschränkung, Preproc-Auto-disable, Fortschrittsanzeige.")
 
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
@@ -64,15 +57,10 @@ def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     if not HAS_SCIPY:
         return x
     nyq = fs/2.0
-    b,a = butter(order, [low/nyq, high/nyq], btype="band")
+    b,a = butter(order, [low/nyq, high/nyq], btype='band')
     return filtfilt(b,a,x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
-    """
-    If CSV contains raw time-series columns (non 'Delta_','Alpha_' etc.),
-    apply notch and bandpass per numeric column and write a temporary csv.
-    Return path to processed csv or original path if no raw data found.
-    """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -120,18 +108,26 @@ def load_session_relatives(csv_path: str) -> pd.DataFrame | None:
     rel = rel.div(total, axis=0).dropna()
     return rel
 
-def build_session_table(root_dir: str, tmpdir: str, fs=250.0):
-    csvs = glob.glob(os.path.join(root_dir, "**", "*.csv"), recursive=True)
+# new: build from a given list of csv paths, with progress bar
+def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
     rows = []
-    for cp in sorted(csvs):
+    total = max(1, len(csv_paths))
+    if st_container is not None:
+        progress = st_container.progress(0)
+        status_text = st_container.empty()
+    for i, cp in enumerate(sorted(csv_paths), start=1):
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
         if dt is None:
+            if st_container is not None:
+                status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
             continue
         proc_path, did_proc = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
         rel = load_session_relatives(proc_path)
         if rel is None or rel.empty:
             rel = load_session_relatives(cp)
             if rel is None or rel.empty:
+                if st_container is not None:
+                    status_text.text(f"Skipping (no band columns): {os.path.basename(cp)}")
                 continue
         alpha = float(rel["alpha"].mean())
         beta  = float(rel["beta"].mean())
@@ -149,8 +145,15 @@ def build_session_table(root_dir: str, tmpdir: str, fs=250.0):
             "gamma": gamma,
             "stress": stress,
             "relax": relax,
-            "proc": did_proc
+            "proc": did_proc,
+            "source": os.path.basename(cp)
         })
+        if st_container is not None:
+            progress.progress(int(i/total*100))
+            status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
+    if st_container is not None:
+        progress.empty()
+        status_text.empty()
     df = pd.DataFrame(rows).dropna().sort_values("datetime").reset_index(drop=True)
     if not df.empty:
         df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
@@ -169,6 +172,7 @@ def try_compute_faa_from_csv(csv_path):
         return np.log(right+1e-9) - np.log(left+1e-9)
     return None
 
+# Plot helpers (Plotly)
 def plot_single_session_interactive(df):
     vals = {
         "Stress": df["stress"].iloc[0],
@@ -240,7 +244,7 @@ if mode.startswith("Datei-Upload"):
         st.success("ZIP entpackt.")
 
 elif mode.startswith("FTP"):
-    st.info("FTP nur unverschlüsselt (Standard-FTP). Für SFTP wähle SFTP-Option.")
+    st.info("FTP unverschlüsselt. Für SFTP wähle SFTP-Option.")
     host = st.text_input("FTP-Host", value="ftp.example.com")
     user = st.text_input("Benutzer", value="anonymous")
     pwd  = st.text_input("Passwort", value="", type="password")
@@ -294,7 +298,27 @@ fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=
 do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=True and HAS_SCIPY)
 st.write("SciPy installiert:", HAS_SCIPY, "  Paramiko (SFTP):", HAS_PARAMIKO)
 
+# --- New: Quick-check of file count and total size, option to limit newest N ---
+csv_paths_all = glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)
+n_csv = len(csv_paths_all)
+total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
+st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
+
+MAX_PREPROC_MB = 200
+if total_mb > MAX_PREPROC_MB and do_preproc:
+    st.warning(f"Preprocessing automatisch deaktiviert (Gesamt {total_mb:.0f} MB > {MAX_PREPROC_MB} MB).")
+    do_preproc = False
+
+limit_sessions = st.checkbox("Beschränke Verarbeitung auf neueste N Sessions (beschleunigt)", value=False)
+max_n = n_csv if n_csv>0 else 0
+if limit_sessions and n_csv>0:
+    default_n = min(100, n_csv)
+    sel_n = st.number_input(f"Neueste N Sessions verarbeiten (max {n_csv})", min_value=1, max_value=n_csv, value=default_n, step=1)
+else:
+    sel_n = None
+
 if st.button("Auswertung starten"):
+    # extract inner zips
     inner_zips = [os.path.join(workdir, f) for f in os.listdir(workdir) if f.lower().endswith(".zip")]
     for zp in inner_zips:
         name = os.path.splitext(os.path.basename(zp))[0]
@@ -305,14 +329,33 @@ if st.button("Auswertung starten"):
         except zipfile.BadZipFile:
             pass
 
+    # refresh csv list after extraction
+    csv_paths_all = glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)
+    csv_paths_all = sorted(csv_paths_all)
+    if sel_n is not None and sel_n>0:
+        csv_paths = csv_paths_all[-int(sel_n):]
+        st.info(f"Verarbeite die neuesten {sel_n} Sessions von {len(csv_paths_all)} insgesamt.")
+    else:
+        csv_paths = csv_paths_all
+        st.info(f"Verarbeite alle {len(csv_paths)} Sessions.")
+
+    # temp dir for preprocessing outputs
     tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
-    df = build_session_table(workdir, tmpdir, fs=fs if do_preproc else 0.0)
+    # pass a container for progress UI
+    container = st.empty()
+    df = build_session_table_from_list(csv_paths, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
+    # cleanup tmpdir
+    try:
+        shutil.rmtree(tmpdir)
+    except Exception:
+        pass
+
     if df.empty:
         st.error("Keine gültigen Sessions gefunden. Prüfe ZIP-Inhalt.")
     else:
+        # FAA attempt
         faa_list = []
-        csv_paths = glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)
-        for cp in sorted(csv_paths):
+        for cp in csv_paths:
             faa = try_compute_faa_from_csv(cp)
             if faa is not None:
                 faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
@@ -335,4 +378,3 @@ if st.button("Auswertung starten"):
         df_out = df.copy(); df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
         st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
                            file_name="summary_indices.csv", mime="text/csv")
-
