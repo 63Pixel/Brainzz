@@ -387,15 +387,18 @@ elif mode == "SFTP (optional)":
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
-# Dropbox: nur konfigurierter Ordner, keine Navigation
-# --- Dropbox: nur konfigurierter Ordner, Checkboxen, keine Navigation ---
+# ---------------- Dropbox: kein Navigation, Checkbox-Auswahl (ersetzen) ----------------
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
-        st.error("Dropbox SDK fehlt. In requirements.txt: dropbox")
+        st.error("Dropbox SDK fehlt. Füge 'dropbox' zu requirements.txt hinzu.")
     else:
         token = st.secrets.get("dropbox", {}).get("access_token") if "dropbox" in st.secrets else os.getenv("DROPBOX_TOKEN")
         configured_path = st.secrets.get("dropbox", {}).get("path") if "dropbox" in st.secrets else ""
-        def normalize_api_path(p: str) -> str:
+        if configured_path is None:
+            configured_path = ""
+
+        # kleine Normalisierung ('' = app-root, sonst mit führendem '/')
+        def _normalize(p):
             if p is None:
                 return ""
             s = str(p).strip().replace("\\", "/")
@@ -403,75 +406,88 @@ elif mode == "Dropbox":
                 return ""
             return s if s.startswith("/") else "/" + s
 
-        api_path = normalize_api_path(configured_path)
+        api_path = _normalize(configured_path)
+
         if not token:
-            st.error("Dropbox-Token fehlt.")
+            st.error("Dropbox-Token fehlt (st.secrets['dropbox']['access_token'] oder DROPBOX_TOKEN).")
         else:
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # Listing nur dieses Ordners
-            files = []
+            # Listing des konfigurierten Ordners (immer ausführen, damit 'files' definiert ist)
+            entries = []
             try:
                 res = dbx.files_list_folder(api_path, recursive=False)
                 entries = res.entries
-                files = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
             except dropbox.exceptions.AuthError:
-                st.error("AuthError: Scopes fehlen (files.metadata.read, files.content.read). Neues Token erzeugen.")
-                files = []
+                st.error("AuthError: Token hat nicht die nötigen Scopes (files.metadata.read, files.content.read). Neues Token erzeugen.")
+                entries = []
             except dropbox.exceptions.ApiError as e:
-                st.error(f"Dropbox ApiError: {getattr(e, 'error_summary', e)}")
-                files = []
+                try:
+                    if hasattr(e.error, "get_path") and e.error.get_path() and e.error.get_path().is_not_found():
+                        st.error("Pfad nicht gefunden. Prüfe st.secrets['dropbox']['path'] (App-folder vs Full Dropbox).")
+                    else:
+                        st.error(f"Dropbox ApiError: {getattr(e, 'error_summary', str(e))}")
+                except Exception:
+                    st.error(f"Dropbox ApiError: {e}")
+                entries = []
             except Exception as e:
                 st.error(f"Dropbox-Fehler: {e}")
-                files = []
+                entries = []
 
-            # Nur ZIP/CSV/SIP anzeigen
-            # --- Dateien im konfigurierten Dropbox-Ordner listen (files vorhanden) ---
-visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
+            # Sichere Definition von 'files'
+            files = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
 
-st.session_state.setdefault("db_files_map", [])
-st.session_state.setdefault("select_all_master", False)
+            # Sichtbare Dateien (nur ZIP/CSV/SIP)
+            visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
 
-if visible_files:
-    files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
-    st.session_state["db_files_map"] = files_map
+            # Persistent keys vorbereiten
+            st.session_state.setdefault("db_files_map", [])
+            st.session_state.setdefault("select_all_master", False)
 
-    # Callback setzt alle Einzel-Checkboxen auf den Master-Wert
-    def _apply_select_all():
-        val = st.session_state.get("select_all_master", False)
-        for i in range(len(files_map)):
-            st.session_state[f"chk_{i}"] = val
+            if visible_files:
+                # stabile Reihenfolge
+                files_map = [(f.path_display, f.path_lower) for f in sorted(visible_files, key=lambda x: x.name.lower())]
+                st.session_state["db_files_map"] = files_map
 
-    st.checkbox("Alle auswählen", key="select_all_master", on_change=_apply_select_all)
+                # Callback für Master-Checkbox
+                def _apply_select_all():
+                    val = st.session_state.get("select_all_master", False)
+                    for i in range(len(files_map)):
+                        st.session_state[f"chk_{i}"] = val
 
-    # Einzel-Checkboxen rendern (keine Zuweisung an session_state!)
-    for i, (disp, _remote) in enumerate(files_map):
-        key = f"chk_{i}"
-        st.checkbox(disp, key=key)  # Streamlit verwaltet den State
+                st.checkbox("Alle auswählen", key="select_all_master", on_change=_apply_select_all)
 
-    # Auswahl einsammeln NACH dem Rendern
-    selected_pairs = []
-    for i, (disp, remote) in enumerate(files_map):
-        if st.session_state.get(f"chk_{i}", False):
-            selected_pairs.append((disp, remote))
+                # Einzel-Checkboxen rendern (Streamlit pflegt den State)
+                for i, (disp, _remote) in enumerate(files_map):
+                    key = f"chk_{i}"
+                    # initial value aus session_state (falls schon gesetzt), ansonsten False
+                    init_val = st.session_state.get(key, False)
+                    st.checkbox(disp, key=key, value=init_val)
 
-    if st.button("Herunterladen ausgewählter Dateien"):
-        if not selected_pairs:
-            st.warning("Keine Datei ausgewählt.")
-        else:
-            downloaded = []
-            for disp, remote in selected_pairs:
-                try:
-                    lp = download_dropbox_file(token, remote, workdir)
-                    downloaded.append(lp)
-                except Exception as e:
-                    st.error(f"Download fehlgeschlagen: {disp} — {e}")
-            if downloaded:
-                recursively_extract_archives(workdir)
-                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
-else:
-    st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+                # Auswahl einsammeln
+                selected_pairs = []
+                for i, (disp, remote) in enumerate(files_map):
+                    if st.session_state.get(f"chk_{i}", False):
+                        selected_pairs.append((disp, remote))
+
+                if st.button("Herunterladen ausgewählter Dateien"):
+                    if not selected_pairs:
+                        st.warning("Keine Datei ausgewählt.")
+                    else:
+                        downloaded = []
+                        for disp, remote in selected_pairs:
+                            try:
+                                lp = download_dropbox_file(token, remote, workdir)
+                                downloaded.append(lp)
+                            except Exception as e:
+                                st.error(f"Download fehlgeschlagen: {disp} — {e}")
+                        if downloaded:
+                            recursively_extract_archives(workdir)
+                            st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert. Jetzt 'Auswertung starten' klicken.")
+            else:
+                st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+
 
 
 
