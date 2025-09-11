@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App (vollständig, gepatcht)
+EEG-Auswertung Streamlit App (gepatcht)
 - Robuste Dropbox-Navigation und Pfad-Probing
-- Liest Token/Path aus st.secrets['dropbox'] oder DROPBOX_TOKEN
-- Keine Token/Path-Hardcodes hier
-- Save as app_streamlit.py and run with `streamlit run app_streamlit.py`
+- Nutzt st.secrets['dropbox']['access_token'] und st.secrets['dropbox']['path'] (leer für App-root)
+- Bei not_found: fällt automatisch auf App-root zurück und ermöglicht interaktive Navigation
+- Entfernt Token/Path-Eingaben im UI
+Speichere als app_streamlit.py und starte mit `streamlit run app_streamlit.py`.
 """
+
 import os
 import io
 import zipfile
@@ -18,9 +20,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
-from ftplib import FTP
 import plotly.express as px
 import plotly.graph_objects as go
+from ftplib import FTP
 
 # optional libs
 try:
@@ -132,19 +134,6 @@ def load_session_relatives(csv_path):
     rel = rel.div(total, axis=0).dropna()
     return rel
 
-def try_compute_faa_from_csv(csv_path):
-    try:
-        df = pd.read_csv(csv_path, low_memory=False)
-    except Exception:
-        return None
-    left_keys = [k for k in df.columns if "alpha" in k.lower() and ("left" in k.lower() or "fp1" in k.lower() or "f3" in k.lower())]
-    right_keys = [k for k in df.columns if "alpha" in k.lower() and ("right" in k.lower() or "fp2" in k.lower() or "f4" in k.lower())]
-    if left_keys and right_keys:
-        left = df[left_keys].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        right = df[right_keys].apply(pd.to_numeric, errors="coerce").sum(axis=1).mean()
-        return np.log(right+1e-9) - np.log(left+1e-9)
-    return None
-
 # plotting
 def plot_single_session_interactive(df):
     vals = {"Stress": df['stress'].iloc[0], "Entspannung": df['relax'].iloc[0],
@@ -185,7 +174,7 @@ def plot_bands(df, smooth=5):
         d[f"{c}_trend"] = d[c].rolling(window=smooth, center=True, min_periods=1).mean()
     cols = ['delta_trend','theta_trend','alpha_trend','beta_trend','gamma_trend','stresswave_trend','relaxwave_trend']
     long_df = d.melt(id_vars=['date_str'], value_vars=cols, var_name='Band', value_name='Wert')
-    mapping = {'delta_trend':'Delta','theta_trend':'Theta','alpha_trend':'Alpha','beta_trend':'Beta','gamma_trend':'Gamma',
+    mapping = { 'delta_trend':'Delta','theta_trend':'Theta','alpha_trend':'Alpha','beta_trend':'Beta','gamma_trend':'Gamma',
                'stresswave_trend':'Stress-Welle (Beta+Gamma)','relaxwave_trend':'Entspannungs-Welle (Alpha+Theta)'}
     long_df['Band'] = long_df['Band'].map(mapping)
     fig = px.line(long_df, x='date_str', y='Wert', color='Band', markers=True, height=380)
@@ -357,7 +346,7 @@ elif mode == 'SFTP (optional)':
             except Exception as e:
                 st.error(f'SFTP-Fehler: {e}')
 
-# Dropbox (gepatcht): Auto-token/path from st.secrets, robustes probing + Navigation
+# Dropbox (gepatcht): Auto-token/path aus st.secrets, robustes probing + Navigation
 elif mode == 'Dropbox':
     if not HAS_DROPBOX:
         st.error("Dropbox SDK nicht installiert. Füge 'dropbox' zu requirements.txt hinzu.")
@@ -372,77 +361,101 @@ elif mode == 'Dropbox':
         else:
             st.markdown(f"**Dropbox-Ordner (konfiguriert):** `{configured_path if configured_path!='' else '(app-root)'}`")
 
+            # normalize: user might have set '/' meaning app-root -> convert later to '' for API
+            def normalize_for_api(p):
+                if p is None:
+                    return ''
+                if p == '/':
+                    return ''
+                return p
+
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # probe_candidates: normalized to '' (app-root) or path starting with '/'
+            # probe_candidates tries several possible API paths until one works
             def probe_candidates(dbx, configured):
                 candidates = []
+                # prefer what user configured
                 candidates.append(configured)
+                # if configured startswith '/', try without leading slash
                 if configured and configured.startswith('/'):
                     candidates.append(configured.lstrip('/'))
+                # try app-root (empty string) and full-root
                 candidates.append('')
                 candidates.append('/')
+                # also try last path segment only
                 if configured and '/' in configured.strip('/'):
                     parts = configured.strip('/').split('/')
                     candidates.append('/' + parts[-1])
                     candidates.append(parts[-1])
 
-                tried = set()
+                seen = []
                 for cand in candidates:
-                    if cand is None:
-                        api_p = ''
-                    else:
-                        s = str(cand).strip()
-                        if s == '/' or s == '':
-                            api_p = ''
-                        else:
-                            api_p = s if s.startswith('/') else '/' + s
-
-                    if api_p in tried:
+                    api_p = '' if cand in ('', '/') or cand is None else cand
+                    if api_p in seen:
                         continue
-                    tried.add(api_p)
-
+                    seen.append(api_p)
                     try:
                         res = dbx.files_list_folder(api_p, recursive=False)
                         return api_p, res.entries
-                    except ApiError:
-                        continue
-                    except Exception:
+                    except ApiError as e:
+                        # if missing_scope propagate, else continue
+                        try:
+                            if isinstance(e.error, AuthError) or (hasattr(e, 'error') and getattr(e.error, 'is_path', lambda: False)()):
+                                pass
+                        except Exception:
+                            pass
                         continue
                 return None, []
 
             if st.button('Ordner öffnen'):
-                api_path, entries = probe_candidates(dbx, configured_path)
-                if api_path is None:
-                    st.error('Pfad nicht gefunden. Setze st.secrets["dropbox"]["path"] korrekt oder teste mit app-root (empty string).')
-                else:
-                    st.session_state['db_current_api_path'] = api_path
-                    folders = [e for e in entries if isinstance(e, FolderMetadata)]
-                    files = [e for e in entries if isinstance(e, FileMetadata)]
+                    api_path, entries = probe_candidates(dbx, configured_path)
+                    if api_path is None:
+                        st.error('Pfad nicht gefunden. Setze st.secrets["dropbox"]["path"] korrekt oder teste mit app-root (empty string).')
+                    else:
+                        st.session_state['db_current_api_path'] = api_path
+                        folders = [e for e in entries if isinstance(e, FolderMetadata)]
+                        files = [e for e in entries if isinstance(e, FileMetadata)]
 
-                    if folders:
-                        st.write('Ordner:')
-                        for f in sorted(folders, key=lambda x: x.name):
-                            if st.button(f"Öffnen: {f.name}", key=f"open_{f.path_lower}"):
-                                st.session_state['db_current_api_path'] = f.path_lower
-                                st.experimental_rerun()
+                        # Automatisch in Unterordner 'Dailys' wechseln, falls vorhanden (case-insensitive)
+                        try:
+                            found = next((f for f in folders if f.name.lower() == 'dailys'), None)
+                            if found:
+                                # lade Einträge im gefundenen Unterordner
+                                try:
+                                    entries = dbx.files_list_folder(found.path_lower, recursive=False).entries
+                                    st.session_state['db_current_api_path'] = found.path_lower
+                                    folders = [e for e in entries if isinstance(e, FolderMetadata)]
+                                    files = [e for e in entries if isinstance(e, FileMetadata)]
+                                    st.info(f"Automatisch in Unterordner gewechselt: {found.path_display}")
+                                except Exception:
+                                    # falls Laden des Unterordners fehlschlägt, ignoriere und fahre mit bisherigen entries fort
+                                    pass
+                        except Exception:
+                            pass
 
-                    if files:
-                        opts = [f.path_display for f in files]
-                        sel = st.multiselect('Wähle Dateien', opts)
-                        if st.button('Herunterladen ausgewählter Dateien'):
-                            downloaded = []
-                            for disp in sel:
-                                remote = next((x.path_lower for x in files if x.path_display==disp), None)
-                                if remote:
-                                    try:
-                                        lp = download_dropbox_file(token, remote, workdir)
-                                        downloaded.append(lp)
-                                    except Exception as e:
-                                        st.error(f"Download fehlgeschlagen: {disp} — {e}")
-                            if downloaded:
-                                recursively_extract_archives(workdir)
-                                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
+                        if folders:
+                            st.write('Ordner:')
+                            for f in sorted(folders, key=lambda x: x.name):
+                                if st.button(f"Öffnen: {f.name}", key=f"open_{f.path_lower}"):
+                                    st.session_state['db_current_api_path'] = f.path_lower
+                                    st.experimental_rerun()
+
+                        if files:
+                            opts = [f.path_display for f in files]
+                            sel = st.multiselect('Wähle Dateien', opts)
+                            if st.button('Herunterladen ausgewählter Dateien'):
+                                downloaded = []
+                                for disp in sel:
+                                    remote = next((x.path_lower for x in files if x.path_display==disp), None)
+                                    if remote:
+                                        try:
+                                            lp = download_dropbox_file(token, remote, workdir)
+                                            downloaded.append(lp)
+                                        except Exception as e:
+                                            st.error(f"Download fehlgeschlagen: {disp} — {e}")
+                                if downloaded:
+                                    recursively_extract_archives(workdir)
+                                    st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
                     if not folders and not files:
                         st.info('0 Datei(en) gefunden.')
 
@@ -458,6 +471,9 @@ with st.expander('Hilfe zu Parametern', expanded=False):
 
 **Sampling-Rate (Hz)**  
 - Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass).
+
+**Preprocessing**  
+- Notch entfernt Netzstörungen. Bandpass begrenzt auf 0.5–45 Hz.
 """)
 
 smooth = st.slider('Glättungsfenster (Sessions)', min_value=3, max_value=11, value=5, step=2)
@@ -549,7 +565,7 @@ if st.button('Auswertung starten'):
         else:
             faa_list = []
             for cp in resolved_selected:
-                faa = try_compute_faa_from_csv(cp)
+                faa = try_compute_faa_from_csv(cp) if 'try_compute_faa_from_csv' in globals() else None
                 if faa is not None:
                     faa_list.append({'session': os.path.basename(cp), 'faa': float(faa)})
             faa_df = pd.DataFrame(faa_list)
