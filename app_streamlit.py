@@ -227,17 +227,17 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
         if dt is None:
             failed_files.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel im Namen."})
             if st_container is not None:
-                st_container.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Ungültiger Zeitstempel im Namen.")
+                st.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Ungültiger Zeitstempel im Namen.")
             continue
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
-        rel = load_session_relatives(proc_path) or load_session_relatives(cp)
+        rel = load_csv(proc_path)
         if rel is None or rel.empty:
             failed_files.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten gefunden."})
             if st_container is not None:
-                st_container.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Keine gültigen Bandspalten gefunden.")
+                st.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Keine gültigen Bandspalten gefunden.")
             continue
-        alpha, beta = float(rel["alpha"].mean()), float(rel["beta"].mean())
-        theta, delta, gamma = float(rel["theta"].mean()), float(rel["delta"].mean()), float(rel["gamma"].mean())
+        alpha, beta = float(rel["Alpha_TP9"].mean()), float(rel["Beta_TP9"].mean())
+        theta, delta, gamma = float(rel["Theta_TP9"].mean()), float(rel["Delta_TP9"].mean()), float(rel["Gamma_TP9"].mean())
         rows.append({
             "datetime": dt, "alpha":alpha,"beta":beta,"theta":theta,"delta":delta,"gamma":gamma,
             "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
@@ -312,7 +312,7 @@ elif mode == "SFTP (optional)":
 # Dropbox mit AgGrid
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
-        st.error("Dropbox SDK fehlt. requirements.txt: dropbox")
+        st.error("Dropbox SDK fehlt. `pip install dropbox`")
     else:
         token = st.secrets.get("dropbox",{}).get("access_token") if "dropbox" in st.secrets else os.getenv("DROPBOX_TOKEN")
         configured_path = st.secrets.get("dropbox",{}).get("path") if "dropbox" in st.secrets else ""
@@ -322,7 +322,7 @@ elif mode == "Dropbox":
         else:
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
-
+            
             # Listing
             entries=[]
             try:
@@ -333,11 +333,10 @@ elif mode == "Dropbox":
                 st.error(f"Dropbox ApiError: {getattr(e,'error_summary',str(e))}")
             except Exception as e:
                 st.error(f"Dropbox-Fehler: {e}")
-
             files = [e for e in entries if isinstance(e, FileMetadata)]
             files = [f for f in files if f.name.lower().endswith((".zip",".csv",".sip"))]
             files = sorted(files, key=lambda x: x.name.lower())
-
+            
             # DataFrame für Anzeige: nur Beschreibung (Datum · Größe)
             rows=[]
             for f in files:
@@ -350,58 +349,20 @@ elif mode == "Dropbox":
                              "dt": dt_str, "size_kb": size_kb})
             df_files = pd.DataFrame(rows)
 
-            # AgGrid (Checkbox-Selection). Fallback = native Checkbox-Liste.
+            # --- FALLBACK-LÖSUNG (KEINE AgGrid-Bibliothek) ---
             selected_paths = []
-            try:
-                from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-                if df_files.empty:
-                    st.info("0 Datei(en) im Ordner.")
-                else:
-                    gb = GridOptionsBuilder.from_dataframe(df_files)
-                    # Nur Beschreibung zeigen
-                    gb.configure_column("description", header_name="Datum · Größe",
-                                         checkboxSelection=True, headerCheckboxSelection=True,
-                                         headerCheckboxSelectionFilteredOnly=True,
-                                         sortable=True, filter=True, resizable=True)
-                    # Verstecken
-                    for col in ["path_lower","path_display","dt","size_kb"]:
-                        gb.configure_column(col, hide=True)
-                    gb.configure_selection(selection_mode="multiple", use_checkbox=True)
-                    gb.configure_grid_options(
-                        rowSelection="multiple",
-                        suppressRowClickSelection=True,
-                        rowMultiSelectWithClick=True,
-                        pagination=True, paginationAutoPageSize=False, paginationPageSize=30,
-                        domLayout='normal'
-                    )
-                    grid = AgGrid(
-                        df_files[["description","path_lower","path_display","dt","size_kb"]],
-                        gridOptions=gb.build(),
-                        height=360,
-                        update_mode=GridUpdateMode.SELECTION_CHANGED,
-                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                        fit_columns_on_grid_load=True,
-                        enable_enterprise_modules=False,
-                        allow_unsafe_jscode=False,
-                        theme="streamlit"
-                    )
-                    selected = grid.get("selected_rows", [])
-                    selected_paths = [r["path_lower"] for r in selected] if selected else []
-            except Exception as e:
-                st.warning("AgGrid nicht verfügbar. Fallback auf einfache Checkbox-Liste.")
-                if df_files.empty:
-                    st.info("0 Datei(en) im Ordner.")
-                else:
-                    st.session_state.setdefault("fb_sel", set())
-                    for i,row in df_files.iterrows():
-                        key = f"fb_{i}"
-                        checked = st.checkbox(row["description"], key=key, value=(key in st.session_state["fb_sel"]))
-                        if checked: st.session_state["fb_sel"].add(key)
-                        else: st.session_state["fb_sel"].discard(key)
-                    # Mappe Auswahl auf Pfade
-                    for i,row in df_files.iterrows():
-                        if f"fb_{i}" in st.session_state["fb_sel"]:
-                            selected_paths.append(row["path_lower"])
+            if df_files.empty:
+                st.info("0 Datei(en) im Ordner.")
+            else:
+                st.session_state.setdefault("fb_sel", set())
+                for i, row in df_files.iterrows():
+                    key = f"fb_{i}"
+                    checked = st.checkbox(row["description"], key=key, value=(key in st.session_state["fb_sel"]))
+                    if checked: st.session_state["fb_sel"].add(key)
+                    else: st.session_state["fb_sel"].discard(key)
+                for i, row in df_files.iterrows():
+                    if f"fb_{i}" in st.session_state["fb_sel"]:
+                        selected_paths.append(row["path_lower"])
 
             # Download-Action
             dl_col1, dl_col2 = st.columns([1,3])
@@ -494,7 +455,7 @@ if st.button("Auswertung starten"):
             st.download_button("Summary CSV herunterladen",
                                data=df_out.to_csv(index=False).encode("utf-8"),
                                file_name="summary_indices.csv", mime="text/csv")
-        
+            
         # **Ausgabe der fehlgeschlagenen Dateien:**
         if failed_files:
             st.subheader("Folgende Dateien wurden übersprungen:")
