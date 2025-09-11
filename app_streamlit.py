@@ -388,6 +388,7 @@ elif mode == "SFTP (optional)":
                 st.error(f"SFTP-Fehler: {e}")
 
 # ---------------- Dropbox: Kachel-Grid, Pagination, Checkboxen (ersetze bisherigen Dropbox-Block) ----------------
+# ---------------- Dropbox: Spalten-/Tabellenansicht (AgGrid) ----------------
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
         st.error("Dropbox SDK fehlt. Füge 'dropbox' zu requirements.txt hinzu.")
@@ -396,16 +397,7 @@ elif mode == "Dropbox":
         configured_path = st.secrets.get("dropbox", {}).get("path") if "dropbox" in st.secrets else ""
         if configured_path is None:
             configured_path = ""
-
-        def _normalize(p: str) -> str:
-            if p is None:
-                return ""
-            s = str(p).strip().replace("\\", "/")
-            if s in ("", "/"):
-                return ""
-            return s if s.startswith("/") else "/" + s
-
-        api_path = _normalize(configured_path)
+        api_path = normalize_api_path(configured_path)
 
         if not token:
             st.error("Dropbox-Token fehlt (st.secrets['dropbox']['access_token'] oder DROPBOX_TOKEN).")
@@ -413,151 +405,128 @@ elif mode == "Dropbox":
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # list current folder (non-recursive)
-            entries = []
+            # Listing (nur direkte Einträge)
             try:
                 res = dbx.files_list_folder(api_path, recursive=False)
                 entries = res.entries
             except dropbox.exceptions.AuthError:
-                st.error("AuthError: Token ohne nötige Scopes. Neues Token erzeugen.")
+                st.error("AuthError: Token ohne nötige Scopes. Erzeuge neues Token mit files.metadata.read + files.content.read.")
                 entries = []
             except dropbox.exceptions.ApiError as e:
-                try:
-                    if hasattr(e.error, "get_path") and e.error.get_path() and e.error.get_path().is_not_found():
-                        st.error("Pfad nicht gefunden. Prüfe st.secrets['dropbox']['path'] (App-folder vs Full Dropbox).")
-                    else:
-                        st.error(f"Dropbox ApiError: {getattr(e, 'error_summary', str(e))}")
-                except Exception:
-                    st.error(f"Dropbox ApiError: {e}")
+                st.error(f"Dropbox ApiError: {getattr(e,'error_summary',str(e))}")
                 entries = []
             except Exception as e:
                 st.error(f"Dropbox-Fehler: {e}")
                 entries = []
 
-            files_all = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
-            visible_files = [f for f in files_all if f.name.lower().endswith((".zip", ".csv", ".sip"))]
-            # stable order
+            files = [e for e in entries if isinstance(e, dropbox.files.FileMetadata)]
+            visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
             visible_files = sorted(visible_files, key=lambda x: x.name.lower())
 
-            # pagination & layout settings (user can change columns/page size)
-            cols_opts = [2,3,4]
-            cols_n = st.selectbox("Spalten pro Zeile", options=cols_opts, index=1, help="Wie viele Kacheln pro Zeile")
-            per_page = st.selectbox("Einträge pro Seite", options=[12,24,36,48], index=1)
+            # build DataFrame with description only shown
+            rows = []
+            for f in visible_files:
+                # date from filename if possible
+                dt = parse_dt_from_path(f.path_display)
+                dt_str = dt.strftime("%d-%m-%y %H:%M") if dt is not None else ""
+                size_kb = int(getattr(f, "size", 0) / 1024) if getattr(f, "size", None) is not None else None
+                size_str = f"{size_kb} KB" if size_kb is not None else ""
+                desc = f"{dt_str} · {size_str}" if dt_str or size_str else f"{f.name}"
+                rows.append({
+                    "description": desc,
+                    "path_display": f.path_display,
+                    "path_lower": f.path_lower,
+                    "dt": dt_str,
+                    "size_kb": size_kb
+                })
+            df_files = pd.DataFrame(rows)
 
-            total = len(visible_files)
-            total_pages = max(1, (total + per_page - 1) // per_page)
-            st.session_state.setdefault("eeg_page", 1)
-            page = st.session_state["eeg_page"]
+            # Try AgGrid first for compact table with checkbox-selection
+            try:
+                from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+                if df_files.empty:
+                    st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+                else:
+                    gb = GridOptionsBuilder.from_dataframe(df_files)
+                    # show only 'description' column; hide path columns but keep them for lookup
+                    gb.configure_column("description", header_name="Datum · Größe", sortable=True, filter=True, resizable=True)
+                    gb.configure_column("dt", header_name="Datum", hide=True)
+                    gb.configure_column("size_kb", header_name="SizeKB", hide=True)
+                    gb.configure_column("path_display", header_name="Name", hide=True)
+                    gb.configure_column("path_lower", header_name="remote", hide=True)
+                    gb.configure_selection(selection_mode="multiple", use_checkbox=True, pre_selected_rows=[])
+                    gb.configure_grid_options(domLayout='normal')
+                    gridOptions = gb.build()
 
-            # navigation
-            nav_cols = st.columns([1,1,6])
-            with nav_cols[0]:
-                if st.button("‹ vorherige") and page > 1:
-                    st.session_state["eeg_page"] = page - 1
-                    st.experimental_rerun()
-            with nav_cols[1]:
-                if st.button("nächste ›") and page < total_pages:
-                    st.session_state["eeg_page"] = page + 1
-                    st.experimental_rerun()
-            with nav_cols[2]:
-                st.markdown(f"Seite **{page} / {total_pages}**  •  Gesamtdateien: **{total}**")
+                    grid_response = AgGrid(
+                        df_files[["description","path_display","path_lower","dt","size_kb"]],
+                        gridOptions=gridOptions,
+                        height=300,
+                        update_mode=GridUpdateMode.SELECTION_CHANGED,
+                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                        fit_columns_on_grid_load=True,
+                        enable_enterprise_modules=False,
+                        allow_unsafe_jscode=False,
+                    )
 
-            # build global files map in session for index lookup
-            files_map_all = [(f.path_display, f.path_lower, f.size if hasattr(f,'size') else None) for f in visible_files]
-            st.session_state["eeg_files_map_all"] = files_map_all
+                    selected = grid_response.get("selected_rows", [])
+                    selected_paths = [r.get("path_lower") for r in selected] if selected else []
 
-            # compute slice for current page
-            start = (page - 1) * per_page
-            end = min(start + per_page, total)
-            page_files = files_map_all[start:end]
-
-            # master-checkbox per page
-            st.session_state.setdefault(f"eeg_select_page_{page}", False)
-            def _apply_select_page():
-                val = st.session_state.get(f"eeg_select_page_{page}", False)
-                for gi in range(start, end):
-                    st.session_state[f"eeg_chk_{gi}"] = val
-            st.checkbox(f"Alle auf Seite {page} auswählen", key=f"eeg_select_page_{page}", on_change=_apply_select_page)
-
-            # render grid of cards
-            if page_files:
-                rows = (len(page_files) + cols_n - 1) // cols_n
-                idx = 0
-                for r in range(rows):
-                    cols = st.columns(cols_n)
-                    for c in cols:
-                        if idx >= len(page_files):
-                            # empty column
-                            with c:
-                                st.write("")
-                            idx += 1
-                            continue
-                        disp, remote, size = page_files[idx]
-                        global_index = start + idx
-                        key = f"eeg_chk_{global_index}"
-                        # ensure key exists with default False
-                        if key not in st.session_state:
-                            st.session_state[key] = False
-                        with c:
-                            # compact card
-                            checked = st.checkbox("", key=key, value=st.session_state.get(key, False))
-                            # show filename truncated in one line
-                            short = disp if len(disp) <= 40 else "…" + disp[-37:]
-                            st.markdown(f"**{short}**")
-                            meta = []
-                            if size is not None:
-                                meta.append(f"{int(size/1024)} KB")
-                            # try to get approximate date from name
-                            dt = parse_dt_from_path(disp)
-                            if dt is None:
-                                # if not, show nothing or placeholder
-                                pass
+                    # compact action bar
+                    st.markdown("---")
+                    c1, c2, c3 = st.columns([3,1,1])
+                    with c1:
+                        st.markdown(f"Ausgewählt: **{len(selected_paths)}**")
+                    with c2:
+                        if st.button("Herunterladen ausgewählter Dateien"):
+                            if not selected_paths:
+                                st.warning("Keine Datei ausgewählt.")
                             else:
-                                meta.append(dt.strftime("%d-%m-%y %H:%M"))
-                            if meta:
-                                st.caption(" · ".join(meta))
-                            idx += 1
+                                downloaded = []
+                                for remote in selected_paths:
+                                    try:
+                                        lp = download_dropbox_file(token, remote, workdir)
+                                        downloaded.append(lp)
+                                    except Exception as e:
+                                        st.error(f"Download fehlgeschlagen: {remote} — {e}")
+                                if downloaded:
+                                    recursively_extract_archives(workdir)
+                                    st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
+                    with c3:
+                        if st.button("Alle abwählen"):
+                            # trick: rerun to clear selection (AgGrid client-side selection cannot be cleared server-side reliably)
+                            st.experimental_rerun()
 
-                # collect selected global indices
-                selected_pairs = []
-                for gi, (disp, remote, _) in enumerate(files_map_all):
-                    if st.session_state.get(f"eeg_chk_{gi}", False):
-                        selected_pairs.append((disp, remote))
-
-                # sticky-like action bar (below grid)
-                st.markdown("---")
-                act_cols = st.columns([2,1,1,1,1])
-                with act_cols[0]:
-                    st.markdown(f"**Ausgewählt: {len(selected_pairs)}**")
-                with act_cols[1]:
-                    if st.button("Herunterladen"):
-                        if not selected_pairs:
+            except Exception:
+                # fallback: compact multiselect with description labels
+                if df_files.empty:
+                    st.info("0 Datei(en) im Ordner.")
+                else:
+                    st.markdown("<small style='color:gray'>streamlit-aggrid nicht installiert. Fallback: kompakte Auswahl.</small>", unsafe_allow_html=True)
+                    options = df_files["description"].tolist()
+                    # map description->path_lower (may not be unique; prefer path_display if needed)
+                    map_desc_to_path = {row["description"] + f" [{i}]": row["path_lower"] for i,row in df_files.reset_index().to_dict(orient="index").items()}
+                    opts_display = list(map_desc_to_path.keys())
+                    sel = st.multiselect("Wähle Dateien (Beschreibung)", opts_display)
+                    if st.button("Herunterladen ausgewählter Dateien"):
+                        if not sel:
                             st.warning("Keine Datei ausgewählt.")
                         else:
                             downloaded = []
-                            for disp, remote in selected_pairs:
+                            for key in sel:
+                                remote = map_desc_to_path.get(key)
+                                if not remote:
+                                    st.error(f"Interner Fehler: Pfad für {key} nicht gefunden.")
+                                    continue
                                 try:
                                     lp = download_dropbox_file(token, remote, workdir)
                                     downloaded.append(lp)
                                 except Exception as e:
-                                    st.error(f"Download fehlgeschlagen: {disp} — {e}")
+                                    st.error(f"Download fehlgeschlagen: {key} — {e}")
                             if downloaded:
                                 recursively_extract_archives(workdir)
                                 st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
-                with act_cols[2]:
-                    if st.button("Alle abwählen"):
-                        for gi in range(len(files_map_all)):
-                            st.session_state[f"eeg_chk_{gi}"] = False
-                with act_cols[3]:
-                    if st.button("Auswahl invertieren"):
-                        for gi in range(len(files_map_all)):
-                            st.session_state[f"eeg_chk_{gi}"] = not st.session_state.get(f"eeg_chk_{gi}", False)
-                with act_cols[4]:
-                    # quick jump: clear page master so UI updates
-                    if st.button("Aktualisieren"):
-                        st.experimental_rerun()
-            else:
-                st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+
 
 
 
