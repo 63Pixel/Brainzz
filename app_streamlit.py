@@ -255,12 +255,7 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
             continue
 
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
-        rel = load_session_relatives(proc_path) or load_session_relatives(cp)
-        if rel is None or rel.empty:
-            failed_files.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten gefunden."})
-            if st_container is not None:
-                status_text.text(f"Skipping (no band columns): {os.path.basename(cp)}")
-            continue
+
 
         alpha, beta = float(rel["alpha"].mean()), float(rel["beta"].mean())
         theta, delta, gamma = float(rel["theta"].mean()), float(rel["delta"].mean()), float(rel["gamma"].mean())
