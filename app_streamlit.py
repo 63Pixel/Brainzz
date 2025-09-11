@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-EEG-Auswertung Streamlit App - Version v4
-Adds:
-- Selection controls to limit which sessions from the package are analysed:
-  * All (default)
-  * Last 1 day, 3 days, 7 days, 14 days
-  * Last N sessions
-Behavior:
-- Filtration uses timestamps parsed from filenames (pattern brainzz_YYYY-MM-DD--HH-MM-SS).
-- If a file lacks a parsable timestamp it is ignored for time-based filters but can be included when "All" or "Last N sessions" is selected (Last N uses those with timestamps).
-Save as app_streamlit_v4.py and deploy like before.
+EEG-Auswertung Streamlit App - Final version with fixes:
+- Robust CSV detection (case-insensitive)
+- Debug preview of files + parsed timestamps
+- Safe "Letzte N Sessions" UI (avoids number_input error)
+- Expander help text for parameters
+- Session-selection modes: Alle / Letzte Tage / Letzte N Sessions
+- Optional limit (neueste N aus Auswahl)
+- Auto-disable heavy preprocessing on large datasets
+- Progress bar during processing
+- Plotly interactive plots, single-session bar, outlier marking, FAA attempt, SFTP optional
+Save as app_streamlit.py and run with streamlit.
 """
-
-import os, io, zipfile, glob, re, tempfile, shutil
+import os
+import io
+import zipfile
+import glob
+import re
+import tempfile
+import shutil
 from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
@@ -22,27 +28,27 @@ from ftplib import FTP
 import plotly.express as px
 import plotly.graph_objects as go
 
-# Optional SFTP support
+# Optional libs
 try:
     import paramiko
     HAS_PARAMIKO = True
 except Exception:
     HAS_PARAMIKO = False
 
-# Signal processing availability
 try:
     from scipy.signal import iirnotch, butter, filtfilt
     HAS_SCIPY = True
 except Exception:
     HAS_SCIPY = False
 
-st.set_page_config(page_title="EEG-Auswertung (v4)", layout="wide")
-st.title("EEG-Auswertung — v4 (Session-Selection)")
-st.caption("Wähle, wie viele Sessions aus dem Paket analysiert werden sollen.")
+st.set_page_config(page_title="EEG-Auswertung", layout="wide")
+st.title("EEG-Auswertung")
+st.caption("Interaktive Auswertung. Wähle ZIP/FTP/SFTP, dann Sessions und Parameter.")
 
+# Regex to parse filename timestamps like: brainzz_2025-09-05--09-47-44
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
-def parse_dt_from_path(path: str):
+def parse_dt_from_path(path):
     m = PAT.search(path)
     if not m:
         return None
@@ -51,7 +57,7 @@ def parse_dt_from_path(path: str):
     except Exception:
         return None
 
-# (kept preprocessing and plotting helpers identical to v3 for brevity)
+# --- optional signal processing helpers (best-effort)
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
     if not HAS_SCIPY:
         return x
@@ -66,6 +72,11 @@ def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     return filtfilt(b,a,x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
+    """
+    If CSV contains raw numeric time-series columns (not band columns),
+    apply notch+bandpass per numeric column and save a _proc.csv.
+    Return processed path and flag whether preprocessing happened.
+    """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -73,6 +84,7 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     band_prefixes = ("Delta_","Theta_","Alpha_","Beta_","Gamma_")
     non_band_cols = [c for c in df.columns if not str(c).startswith(band_prefixes)]
     numeric_cols = [c for c in non_band_cols if np.issubdtype(df[c].dtype, np.number)]
+    # heuristics: require some numeric columns and some samples and SciPy presence
     if len(numeric_cols) < 2 or len(df) < 10 or not HAS_SCIPY:
         return csv_path, False
     proc = df.copy()
@@ -88,7 +100,12 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     proc.to_csv(out_path, index=False)
     return out_path, True
 
-def load_session_relatives(csv_path: str) -> pd.DataFrame | None:
+def load_session_relatives(csv_path):
+    """
+    Read CSV and return dataframe with relative band sums per row:
+    columns delta,theta,alpha,beta,gamma (values normalized per row).
+    Accepts either aggregated columns 'Alpha' or per-channel 'Alpha_Fp1' etc.
+    """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -128,6 +145,7 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
         proc_path, did_proc = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
         rel = load_session_relatives(proc_path)
         if rel is None or rel.empty:
+            # fallback try original file
             rel = load_session_relatives(cp)
             if rel is None or rel.empty:
                 if st_container is not None:
@@ -164,6 +182,7 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     return df
 
 def try_compute_faa_from_csv(csv_path):
+    """Best-effort FAA from alpha left/right columns."""
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -176,7 +195,7 @@ def try_compute_faa_from_csv(csv_path):
         return np.log(right+1e-9) - np.log(left+1e-9)
     return None
 
-# Plot helpers (Plotly)
+# --- Plot helpers (Plotly) ---
 def plot_single_session_interactive(df):
     vals = {
         "Stress": df["stress"].iloc[0],
@@ -193,7 +212,7 @@ def plot_single_session_interactive(df):
     fig.update_layout(margin=dict(l=20,r=20,t=40,b=20))
     return fig
 
-def plot_stress_relax(df, smooth:int=5, outlier_z=3.0):
+def plot_stress_relax(df, smooth=5, outlier_z=3.0):
     df = df.copy()
     df["stress_z"] = (df["stress"] - df["stress"].mean()) / (df["stress"].std(ddof=0) + 1e-9)
     df["relax_z"]  = (df["relax"]  - df["relax"].mean())  / (df["relax"].std(ddof=0)  + 1e-9)
@@ -215,7 +234,7 @@ def plot_stress_relax(df, smooth:int=5, outlier_z=3.0):
     fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
     return fig
 
-def plot_bands(df, smooth:int=5):
+def plot_bands(df, smooth=5):
     d = df.copy()
     d["stresswave"] = d["beta"] + d["gamma"]
     d["relaxwave"]  = d["alpha"] + d["theta"]
@@ -233,19 +252,22 @@ def plot_bands(df, smooth:int=5):
     fig.update_traces(hovertemplate="Datum: %{x}<br>%{y:.3f}")
     return fig
 
-# ---- UI ----
+# ---------------- UI ----------------
 st.subheader("1) Datenquelle wählen")
-mode = st.radio("Quelle", ["Datei-Upload (ZIP/Ordner als ZIP)", "FTP-Download", "SFTP (optional)"], horizontal=True)
+mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)"], horizontal=True)
 
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
 
 if mode.startswith("Datei-Upload"):
-    up = st.file_uploader("ZIP-Datei hochladen", type=["zip"])
+    up = st.file_uploader("ZIP-Datei hochladen (pack das Paket mit CSVs)", type=["zip"])
     if up is not None:
         zbytes = up.read()
-        with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
-            zf.extractall(workdir)
-        st.success("ZIP entpackt.")
+        try:
+            with zipfile.ZipFile(io.BytesIO(zbytes), "r") as zf:
+                zf.extractall(workdir)
+            st.success("ZIP entpackt.")
+        except Exception as e:
+            st.error(f"ZIP konnte nicht entpackt werden: {e}")
 
 elif mode.startswith("FTP"):
     st.info("FTP unverschlüsselt. Für SFTP wähle SFTP-Option.")
@@ -254,16 +276,17 @@ elif mode.startswith("FTP"):
     pwd  = st.text_input("Passwort", value="", type="password")
     remote_dir = st.text_input("Remote-Pfad", value="/")
     pattern = st.text_input("Dateimuster (z. B. .zip)", value=".zip")
-    go = st.button("Vom FTP laden")
-    if go:
+    if st.button("Vom FTP laden"):
         try:
             ftp = FTP(host); ftp.login(user=user, passwd=pwd); ftp.cwd(remote_dir)
             names = ftp.nlst()
             targets = [n for n in names if pattern in n]
+            if not targets:
+                st.warning("Keine passenden Dateien auf FTP gefunden.")
             for name in targets:
                 loc = os.path.join(workdir, name)
                 with open(loc, "wb") as f:
-                    ftp.retrbinary(f"RETR {name}", f.write)
+                    ftp.retrbinary(f"RETR " + name, f.write)
             st.success(f"{len(targets)} Datei(en) geladen.")
             ftp.quit()
         except Exception as e:
@@ -271,21 +294,22 @@ elif mode.startswith("FTP"):
 
 elif mode.startswith("SFTP"):
     if not HAS_PARAMIKO:
-        st.error("Paramiko nicht installiert. Installiere paramiko für SFTP-Unterstützung.")
+        st.error("Paramiko nicht installiert. SFTP nicht verfügbar.")
     else:
         host = st.text_input("SFTP-Host", value="sftp.example.com")
         user = st.text_input("Benutzer", value="user")
         pwd  = st.text_input("Passwort", value="", type="password")
         remote_dir = st.text_input("Remote-Pfad", value="/")
         pattern = st.text_input("Dateimuster (z. B. .zip)", value=".zip")
-        go = st.button("Vom SFTP laden")
-        if go:
+        if st.button("Vom SFTP laden"):
             try:
                 transport = paramiko.Transport((host, 22))
                 transport.connect(username=user, password=pwd)
                 sftp = paramiko.SFTPClient.from_transport(transport)
                 files = sftp.listdir(remote_dir)
                 targets = [f for f in files if pattern in f]
+                if not targets:
+                    st.warning("Keine passenden Dateien auf SFTP gefunden.")
                 for name in targets:
                     remotepath = os.path.join(remote_dir, name)
                     localpath = os.path.join(workdir, name)
@@ -295,28 +319,59 @@ elif mode.startswith("SFTP"):
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
+# ---------- Parameters / QC ----------
 st.subheader("2) Parameter / QC")
+with st.expander("Hilfe zu Parametern"):
+    st.markdown("""
+**Glättungsfenster (Sessions)**  
+- Anzahl Sessions für die Trend-Glättung. Größer = glatter, kleiner = detailreicher. Empfehlung: 3–7.
+
+**Outlier z-Schwelle**  
+- Markiert Messwerte mit hoher Abweichung. Empfehlung: 2.5–3.5.
+
+**Sampling-Rate (Hz)**  
+- Nur für Rohdaten-Preprocessing nötig (Notch/Bandpass). Häufig 250 Hz.
+
+**Preprocessing**  
+- Notch entfernt Netzstörungen (50/60 Hz). Bandpass begrenzt auf 0.5–45 Hz.
+- Nur aktivieren wenn CSV Rohzeitreihen enthält. SciPy benötigt.
+""")
+
 smooth = st.slider("Glättungsfenster (Sessions)", min_value=3, max_value=11, value=5, step=2)
 outlier_z = st.slider("Outlier z-Schwelle", min_value=1.5, max_value=5.0, value=3.0, step=0.5)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
-do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=True and HAS_SCIPY)
-st.write("SciPy installiert:", HAS_SCIPY, "  Paramiko (SFTP):", HAS_PARAMIKO)
+do_preproc = st.checkbox("Versuche Notch+Bandpass-Preprocessing wenn Rohdaten vorhanden", value=(True and HAS_SCIPY))
+# concise info about availability
+st.info(f"SciPy: {'ja' if HAS_SCIPY else 'nein'}  ·  Paramiko (SFTP): {'ja' if HAS_PARAMIKO else 'nein'}")
 
-# --- New: Quick-check of file count and total size, option to limit newest N ---
-csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
-                 if os.path.isfile(p) and p.lower().endswith(".csv")]
+# --- Debug: show workdir contents and CSV timestamp parsing ---
+all_files = sorted([p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)])
+csv_paths_all = [p for p in all_files if os.path.isfile(p) and p.lower().endswith(".csv")]
+st.write("**Debug: Arbeitsverzeichnis (erste 200 Einträge)**")
+st.write([os.path.relpath(p, workdir) for p in all_files[:200]] if all_files else "workdir leer")
+
+st.write(f"Gefundene CSV-Dateien (insgesamt): {len(csv_paths_all)}")
+if csv_paths_all:
+    preview = []
+    for p in csv_paths_all[:200]:
+        dt = parse_dt_from_path(p)
+        preview.append({"file": os.path.relpath(p, workdir), "timestamp_parsed": bool(dt), "dt": dt})
+    st.dataframe(pd.DataFrame(preview))
+
+# quick size check and auto-disable heavy preprocessing if huge
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv}  —  Gesamtgröße: {total_mb:.1f} MB")
-
 MAX_PREPROC_MB = 200
 if total_mb > MAX_PREPROC_MB and do_preproc:
     st.warning(f"Preprocessing automatisch deaktiviert (Gesamt {total_mb:.0f} MB > {MAX_PREPROC_MB} MB).")
     do_preproc = False
 
-# -- Session selection UI: by timeframe or last N sessions --
+# ---------------- Session selection UI ----------------
 st.markdown("**Wähle, welche Sessions verarbeitet werden sollen**")
 sel_mode = st.selectbox("Modus", ["Alle Sessions (default)", "Letzte Tage", "Letzte N Sessions"])
+
+# default selected list
 selected_csvs = csv_paths_all.copy()
 
 if sel_mode == "Letzte Tage":
@@ -331,93 +386,115 @@ if sel_mode == "Letzte Tage":
             selected.append(p)
     selected_csvs = sorted(selected)
     st.write(f"{len(selected_csvs)} Sessions im Zeitraum der letzten {days} Tage gefunden.")
+
 elif sel_mode == "Letzte N Sessions":
-    max_n = len(csv_paths_all)
-    default_n = min(30, max_n) if max_n>0 else 0
-    n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n if max_n>0 else 1, value=default_n, step=1)
-    # choose newest by parsed datetime; if parse fails, exclude
+    # find only files with parseable timestamps
     parsed = [(p, parse_dt_from_path(p)) for p in csv_paths_all]
     parsed = [t for t in parsed if t[1] is not None]
-    parsed_sorted = sorted(parsed, key=lambda x: x[1])
-    selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
-    st.write(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
+    if not parsed:
+        st.warning("Keine mit Timestamp erkennbaren Sessions gefunden. Wähle 'Alle Sessions' oder 'Letzte Tage'.")
+        selected_csvs = []
+    else:
+        parsed_sorted = sorted(parsed, key=lambda x: x[1])
+        max_n = len(parsed_sorted)
+        default_n = min(30, max_n)
+        # safe number_input because max_n >= 1
+        n_sel = st.number_input("Anzahl neuester Sessions", min_value=1, max_value=max_n, value=default_n, step=1)
+        selected_csvs = [p for p,_ in parsed_sorted[-int(n_sel):]]
+        st.write(f"{len(selected_csvs)} Sessions ausgewählt (neueste {n_sel}).")
+
 else:
     st.write(f"{len(selected_csvs)} Sessions (Alle)")
 
+# additional optional limiter
 limit_sessions = st.checkbox("Beschränke Verarbeitung zusätzlich auf neueste N Sessions (beschleunigt)", value=False)
 if limit_sessions and len(selected_csvs)>0:
     default_n2 = min(100, len(selected_csvs))
-    sel_n2 = st.number_input(f"Wenn aktiv: verarbeite nur die neuesten N aus der Auswahl (max {len(selected_csvs)})", min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
+    sel_n2 = st.number_input(f"Wenn aktiv: verarbeite nur die neuesten N aus der Auswahl (max {len(selected_csvs)})",
+                             min_value=1, max_value=len(selected_csvs), value=default_n2, step=1)
     if sel_n2 < len(selected_csvs):
-        # sort selected by parsed date and keep newest sel_n2
         parsed2 = [(p, parse_dt_from_path(p)) for p in selected_csvs]
         parsed2 = [t for t in parsed2 if t[1] is not None]
         parsed2_sorted = sorted(parsed2, key=lambda x: x[1])
         selected_csvs = [p for p,_ in parsed2_sorted[-int(sel_n2):]]
         st.write(f"Verarbeite jetzt {len(selected_csvs)} Sessions (neueste {sel_n2} aus Auswahl).")
 
+# preview selected (user requested UI clarity)
+if selected_csvs:
+    st.write("Preview der auszuwertenden Sessions (erste 20):")
+    st.write([os.path.basename(p) for p in selected_csvs[:20]])
+else:
+    st.info("Keine Sessions ausgewählt.")
+
+# ---------------- Run analysis ----------------
 if st.button("Auswertung starten"):
-    # extract inner zips
+    # unpack inner zips if any
     inner_zips = [os.path.join(workdir, f) for f in os.listdir(workdir) if f.lower().endswith(".zip")]
     for zp in inner_zips:
-        name = os.path.splitext(os.path.basename(zp))[0]
-        out = os.path.join(workdir, name); os.makedirs(out, exist_ok=True)
+        out = os.path.join(workdir, os.path.splitext(os.path.basename(zp))[0])
+        os.makedirs(out, exist_ok=True)
         try:
             with zipfile.ZipFile(zp, "r") as zf:
                 zf.extractall(out)
-        except zipfile.BadZipFile:
+        except Exception:
             pass
 
-    # refresh selection after extraction: recompute csv_paths_all and intersect with selected_csvs by basename if needed
+    # refresh csv list and resolve selection by basename (so newly extracted files match)
     csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*"), recursive=True)
                      if os.path.isfile(p) and p.lower().endswith(".csv")]
-    # if selection was built before extraction, re-resolve by basename matching
-    basenames = {os.path.basename(p): p for p in csv_paths_all}
+    csv_paths_all = sorted(csv_paths_all)
+    basenames_map = {os.path.basename(p): p for p in csv_paths_all}
+
     resolved_selected = []
+    # if selection contains basenames, match them; otherwise use selection as full paths
     for p in selected_csvs:
         b = os.path.basename(p)
-        if b in basenames:
-            resolved_selected.append(basenames[b])
-    # if selection empty after resolution, fall back to all csvs
+        if b in basenames_map:
+            resolved_selected.append(basenames_map[b])
+    # if resolved empty, fall back to using all csvs (avoid processing zero files)
     if not resolved_selected:
         resolved_selected = csv_paths_all
 
-    # show final count
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(resolved_selected)}")
 
-    # temp dir for preprocessing outputs
-    tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
-    container = st.empty()
-    df = build_session_table_from_list(resolved_selected, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
-    try:
-        shutil.rmtree(tmpdir)
-    except Exception:
-        pass
-
-    if df.empty:
-        st.error("Keine gültigen Sessions gefunden. Prüfe ZIP-Inhalt.")
+    if len(resolved_selected) == 0:
+        st.error("Keine CSVs zum Verarbeiten gefunden. Prüfe das Arbeitsverzeichnis oder lade das ZIP neu hoch.")
     else:
-        faa_list = []
-        for cp in resolved_selected:
-            faa = try_compute_faa_from_csv(cp)
-            if faa is not None:
-                faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
-        faa_df = pd.DataFrame(faa_list)
+        tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
+        container = st.empty()
+        df = build_session_table_from_list(resolved_selected, tmpdir, fs=fs if do_preproc else 0.0, st_container=container)
+        # cleanup
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
 
-        if len(df) == 1:
-            st.subheader("Einzel-Session Analyse")
-            st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
-            st.dataframe(df.round(4))
-            if not faa_df.empty:
-                st.write("FAA (geschätzt) für einzelne Sessions:"); st.dataframe(faa_df.round(4))
+        if df.empty:
+            st.error("Keine gültigen Sessions (mit Bandspalten) gefunden. Prüfe Dateiformat.")
         else:
-            st.subheader("Stress/Entspannung (ohne Lücken)")
-            st.plotly_chart(plot_stress_relax(df, smooth=smooth, outlier_z=outlier_z), use_container_width=True)
-            st.subheader("Bänder + Stress-/Entspannungswellen")
-            st.plotly_chart(plot_bands(df, smooth=smooth), use_container_width=True)
-            st.subheader("Session Übersicht (Tabelle)")
-            st.dataframe(df.round(4))
+            # FAA attempts per CSV (best-effort)
+            faa_list = []
+            for cp in resolved_selected:
+                faa = try_compute_faa_from_csv(cp)
+                if faa is not None:
+                    faa_list.append({"session": os.path.basename(cp), "faa": float(faa)})
+            faa_df = pd.DataFrame(faa_list)
 
-        df_out = df.copy(); df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-        st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
-                           file_name="summary_indices.csv", mime="text/csv")
+            if len(df) == 1:
+                st.subheader("Einzel-Session Analyse")
+                st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
+                st.dataframe(df.round(4))
+                if not faa_df.empty:
+                    st.write("FAA (geschätzt) für einzelne Sessions:"); st.dataframe(faa_df.round(4))
+            else:
+                st.subheader("Stress/Entspannung (ohne Lücken)")
+                st.plotly_chart(plot_stress_relax(df, smooth=smooth, outlier_z=outlier_z), use_container_width=True)
+                st.subheader("Bänder + Stress-/Entspannungswellen")
+                st.plotly_chart(plot_bands(df, smooth=smooth), use_container_width=True)
+                st.subheader("Session Übersicht (Tabelle)")
+                st.dataframe(df.round(4))
+
+            df_out = df.copy()
+            df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.download_button("Summary CSV herunterladen", data=df_out.to_csv(index=False).encode("utf-8"),
+                               file_name="summary_indices.csv", mime="text/csv")
