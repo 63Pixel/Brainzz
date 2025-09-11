@@ -319,6 +319,7 @@ st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
 
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
+selected_paths = [] # Initialize selected_paths outside of the 'if' block to make it accessible
 
 # Upload
 if mode == "Datei-Upload (ZIP)":
@@ -387,8 +388,7 @@ elif mode == "SFTP (optional)":
             except Exception as e:
                 st.error(f"SFTP-Fehler: {e}")
 
-# ---------------- Dropbox: Kachel-Grid, Pagination, Checkboxen (ersetze bisherigen Dropbox-Block) ----------------
-# ---------------- Dropbox: Spalten-/Tabellenansicht (AgGrid) ----------------
+# Dropbox
 elif mode == "Dropbox":
     if not HAS_DROPBOX:
         st.error("Dropbox SDK fehlt. Füge 'dropbox' zu requirements.txt hinzu.")
@@ -405,7 +405,6 @@ elif mode == "Dropbox":
             st.markdown(f"**Dropbox-Ordner:** `{api_path if api_path else '(app-root)'}`")
             dbx = dropbox.Dropbox(token, timeout=300)
 
-            # Listing (nur direkte Einträge)
             try:
                 res = dbx.files_list_folder(api_path, recursive=False)
                 entries = res.entries
@@ -423,60 +422,72 @@ elif mode == "Dropbox":
             visible_files = [f for f in files if f.name.lower().endswith((".zip", ".csv", ".sip"))]
             visible_files = sorted(visible_files, key=lambda x: x.name.lower())
 
-            try:
-                from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
-                if df_files.empty:
-                    st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
-                else:
-                    gb = GridOptionsBuilder.from_dataframe(df_files)
-                    gb.configure_column("description", header_name="Datum · Größe", sortable=True, filter=True, resizable=True)
-                    gb.configure_column("dt", header_name="Datum", hide=True)
-                    gb.configure_column("size_kb", header_name="SizeKB", hide=True)
-                    gb.configure_column("path_display", header_name="Name", hide=True)
-                    gb.configure_column("path_lower", header_name="remote", hide=True)
-                    gb.configure_selection(selection_mode="multiple", use_checkbox=True, pre_selected_rows=[])
-                    gb.configure_grid_options(domLayout='normal')
-                    gridOptions = gb.build()
+            rows = []
+            for f in visible_files:
+                dt = parse_dt_from_path(f.path_display)
+                dt_str = dt.strftime("%d-%m-%y %H:%M") if dt is not None else ""
+                size_kb = int(getattr(f, "size", 0) / 1024) if getattr(f, "size", None) is not None else None
+                size_str = f"{size_kb} KB" if size_kb is not None else ""
+                desc = f"{dt_str} · {size_str}" if dt_str or size_str else f"{f.name}"
+                rows.append({
+                    "description": desc,
+                    "path_display": f.path_display,
+                    "path_lower": f.path_lower,
+                    "dt": dt_str,
+                    "size_kb": size_kb
+                })
+            df_files = pd.DataFrame(rows)
 
-                    grid_response = AgGrid(
-                        df_files[["description","path_display","path_lower","dt","size_kb"]],
-                        gridOptions=gridOptions,
-                        height=300,
-                        update_on=[GridUpdateMode.SELECTION_CHANGED],
-                        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-                        fit_columns_on_grid_load=True,
-                        enable_enterprise_modules=False,
-                        allow_unsafe_jscode=False,
-                    )
+            from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, DataReturnMode
+            if df_files.empty:
+                st.info("0 Datei(en) im Ordner (nur direkte Einträge, keine Unterordner).")
+            else:
+                gb = GridOptionsBuilder.from_dataframe(df_files)
+                gb.configure_column("description", header_name="Datum · Größe", sortable=True, filter=True, resizable=True)
+                gb.configure_column("dt", header_name="Datum", hide=True)
+                gb.configure_column("size_kb", header_name="SizeKB", hide=True)
+                gb.configure_column("path_display", header_name="Name", hide=True)
+                gb.configure_column("path_lower", header_name="remote", hide=True)
+                gb.configure_selection(selection_mode="multiple", use_checkbox=True, pre_selected_rows=[])
+                gb.configure_grid_options(domLayout='normal')
+                gridOptions = gb.build()
 
-                    selected = grid_response.get("selected_rows", [])
-                    selected_paths = [r.get("path_lower") for r in selected] if selected else []
+                grid_response = AgGrid(
+                    df_files[["description","path_display","path_lower","dt","size_kb"]],
+                    gridOptions=gridOptions,
+                    height=300,
+                    update_on=[GridUpdateMode.SELECTION_CHANGED],
+                    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+                    fit_columns_on_grid_load=True,
+                    enable_enterprise_modules=False,
+                    allow_unsafe_jscode=False,
+                )
 
-                    st.markdown("---")
-                    c1, c2, c3 = st.columns([3,1,1])
-                    with c1:
-                        st.markdown(f"Ausgewählt: **{len(selected_paths)}**")
-                    with c2:
-                        if st.button("Herunterladen ausgewählter Dateien"):
-                            if not selected_paths:
-                                st.warning("Keine Datei ausgewählt.")
-                            else:
-                                downloaded = []
-                                for remote in selected_paths:
-                                    try:
-                                        lp = download_dropbox_file(token, remote, workdir)
-                                        downloaded.append(lp)
-                                    except Exception as e:
-                                        st.error(f"Download fehlgeschlagen: {remote} — {e}")
-                                if downloaded:
-                                    recursively_extract_archives(workdir)
-                                    st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
-                    with c3:
-                        if st.button("Alle abwählen"):
-                            st.experimental_rerun()
+                selected = grid_response.get("selected_rows", [])
+                selected_paths = [r.get("path_lower") for r in selected] if selected else []
 
-            except Exception:
-                st.error("Fehler beim Laden von streamlit-aggrid. Bitte stelle sicher, dass die Bibliothek korrekt installiert ist.")
+                st.markdown("---")
+                c1, c2, c3 = st.columns([3,1,1])
+                with c1:
+                    st.markdown(f"Ausgewählt: **{len(selected_paths)}**")
+                with c2:
+                    if st.button("Herunterladen ausgewählter Dateien"):
+                        if not selected_paths:
+                            st.warning("Keine Datei ausgewählt.")
+                        else:
+                            downloaded = []
+                            for remote in selected_paths:
+                                try:
+                                    lp = download_dropbox_file(token, remote, workdir)
+                                    downloaded.append(lp)
+                                except Exception as e:
+                                    st.error(f"Download fehlgeschlagen: {remote} — {e}")
+                            if downloaded:
+                                recursively_extract_archives(workdir)
+                                st.success(f"{len(downloaded)} Datei(en) heruntergeladen und extrahiert.")
+                with c3:
+                    if st.button("Alle abwählen"):
+                        st.experimental_rerun()
 
 
 # ---------- Parameter / QC ----------
