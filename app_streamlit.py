@@ -216,42 +216,82 @@ def download_dropbox_file(dbx_token: str, remote_path: str, local_dir: str):
     return local_path
 
 def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None):
-    rows=[]
-    failed_files=[]
+    rows, failed_files = [], []
     total = max(1, len(csv_paths))
     if st_container is not None:
-        progress = st_container.progress(0)
-        status_text = st_container.empty()
+        progress = st_container.progress(0); status_text = st_container.empty()
+
     for i, cp in enumerate(sorted(csv_paths), start=1):
+        # 1) ist es wirklich eine CSV?
+        try:
+            _ = pd.read_csv(cp, nrows=1)
+        except Exception:
+            failed_files.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
+            if st_container is not None:
+                status_text.text(f"Skipping (no CSV): {os.path.basename(cp)}")
+            continue
+
+        # 2) Zeitstempel aus Pfad
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
         if dt is None:
             failed_files.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel im Namen."})
             if st_container is not None:
-                st.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Ungültiger Zeitstempel im Namen.")
+                status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
             continue
-        proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
-        rel = load_csv(proc_path)
-        if rel is None or rel.empty:
-            rel = load_csv(cp)
-        if rel is None or rel.empty:
+
+        # 3) Preprocessing falls Rohdaten
+        proc_path, _ = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
+
+        # 4) Relativanteile laden (erst proc, dann original)
+        rel = load_session_relatives(proc_path)
+        if rel is None:
+            rel = load_session_relatives(cp)
+
+        # 5) Validieren: DataFrame, nicht leer, alle Bänder vorhanden
+        if not isinstance(rel, pd.DataFrame) or rel.empty:
             failed_files.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten gefunden."})
             if st_container is not None:
-                st.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Keine gültigen Bandspalten gefunden.")
+                status_text.text(f"Skipping (no band columns): {os.path.basename(cp)}")
             continue
-        alpha, beta = float(rel["Alpha_TP9"].mean()), float(rel["Beta_TP9"].mean())
-        theta, delta, gamma = float(rel["Theta_TP9"].mean()), float(rel["Delta_TP9"].mean()), float(rel["Gamma_TP9"].mean())
+
+        # Spaltennamen vereinheitlichen
+        rel.columns = [str(c).lower() for c in rel.columns]
+        needed = {"alpha","beta","theta","delta","gamma"}
+        if not needed.issubset(set(rel.columns)):
+            failed_files.append({"source": os.path.basename(cp), "reason": "Bandspalten fehlen (alpha/beta/theta/delta/gamma)."})
+            if st_container is not None:
+                status_text.text(f"Skipping (missing bands): {os.path.basename(cp)}")
+            continue
+
+        # 6) Kennzahlen
+        try:
+            alpha = float(rel["alpha"].mean())
+            beta  = float(rel["beta"].mean())
+            theta = float(rel["theta"].mean())
+            delta = float(rel["delta"].mean())
+            gamma = float(rel["gamma"].mean())
+        except Exception:
+            failed_files.append({"source": os.path.basename(cp), "reason": "Numerikfehler in Bandspalten."})
+            continue
+
         rows.append({
-            "datetime": dt, "alpha":alpha,"beta":beta,"theta":theta,"delta":delta,"gamma":gamma,
+            "datetime": dt, "alpha": alpha, "beta": beta, "theta": theta, "delta": delta, "gamma": gamma,
             "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
         })
+
         if st_container is not None:
             progress.progress(int(i/total*100))
             status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
+
     if st_container is not None:
         progress.empty(); status_text.empty()
+
     df = pd.DataFrame(rows)
-    if not df.empty: df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
+    if not df.empty:
+        df = df.sort_values("datetime").reset_index(drop=True)
+        df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
     return df, failed_files
+
 
 # --------- UI: Quelle ---------
 st.subheader("1) Datenquelle wählen")
