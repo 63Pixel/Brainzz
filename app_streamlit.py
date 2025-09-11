@@ -43,7 +43,7 @@ st.markdown("""
 <style>
 .badge{display:inline-block;padding:4px 8px;border-radius:8px;color:#fff;font-size:12px;margin-right:8px}
 .badge-recent{background:#ff8c00}
-.badge-newest{background:#28a745}
+.badge-newest{background:#0b3d91}
 .badge-both{background:#6f42c1}
 .session-row{padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
 </style>
@@ -55,7 +55,7 @@ st.markdown("""
 :root{
   --expander-bg: #e9ecef;
   --expander-text: #0b3d91;
-  --expander-open-bg: #28a745;
+  --expander-open-bg: #0b3d91;
   --expander-open-text: #ffffff;
 }
 div.stExpander > div[data-testid="stExpander"] > details > summary,
