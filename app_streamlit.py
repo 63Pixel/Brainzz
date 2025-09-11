@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# EEG-Auswertung – kompakt, mit Dropbox-AgGrid-Auswahl
+# EEG-Auswertung Streamlit App
+# - Dropbox: kein Verzeichniswechsel, nur Dateien im konfigurierten Ordner
+# - Checkbox "Alle auswählen" + Multiselect
+# - ZIP/SIP werden nach Download rekursiv extrahiert
+# - Analyse (Stress/Entspannung, Bänder, FAA)
 
 import os, io, re, glob, zipfile, tempfile, shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 import numpy as np
 import pandas as pd
 import streamlit as st
+from ftplib import FTP
 import plotly.express as px
 import plotly.graph_objects as go
-from ftplib import FTP
 
-# Optional
+# optional
 try:
     import paramiko
     HAS_PARAMIKO = True
@@ -24,7 +28,7 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# Dropbox SDK
+# Dropbox
 try:
     import dropbox
     from dropbox.files import FileMetadata, FolderMetadata
@@ -37,14 +41,19 @@ st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
 st.caption("ZIP/FTP/SFTP/Dropbox → Dateien wählen → Auswertung starten")
 
-# --------- Styling (kleinere Liste, kompakte Controls) ----------
+# ---------- Styles ----------
 st.markdown("""
 <style>
+:root{ --expander-bg:#e9ecef; --expander-text:#0b3d91; --expander-open-bg:#28a745; --expander-open-text:#fff }
+details > summary{ background:var(--expander-bg)!important; font-size:12px; font-weight:bold; color:var(--expander-text); padding:0.5em 1em; margin-bottom:1em; border-radius:0.5em; border:1px solid #ced4da; transition:all 0.2s ease-in-out }
+details[open] > summary{ background:var(--expander-open-bg)!important; color:var(--expander-open-text); border:1px solid var(--expander-open-bg); }
+details > summary::-webkit-details-marker{ display:none; }
 div[data-baseweb="select"] { font-size:12px !important; }
 div[role="listbox"]{ max-height:300px !important; font-size:12px !important; }
 .ag-theme-streamlit-dark, .ag-theme-alpine{ --ag-font-size:12px; --ag-list-item-height:24px; }
 </style>
 """, unsafe_allow_html=True)
+
 
 # --------- Helpers ----------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
@@ -193,10 +202,16 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
         status_text = st_container.empty()
     for i, cp in enumerate(sorted(csv_paths), start=1):
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
-        if dt is None: continue
+        if dt is None:
+            if st_container is not None:
+                st_container.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Ungültiger Zeitstempel im Namen.")
+            continue
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
         rel = load_session_relatives(proc_path) or load_session_relatives(cp)
-        if rel is None or rel.empty: continue
+        if rel is None or rel.empty:
+            if st_container is not None:
+                st_container.warning(f"Datei '{os.path.basename(cp)}' übersprungen: Keine gültigen Bandspalten gefunden.")
+            continue
         alpha, beta = float(rel["alpha"].mean()), float(rel["beta"].mean())
         theta, delta, gamma = float(rel["theta"].mean()), float(rel["delta"].mean()), float(rel["gamma"].mean())
         rows.append({
@@ -219,7 +234,7 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
 st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
 workdir = tempfile.mkdtemp(prefix="eeg_works_")
-selected_paths = [] # Initialize selected_paths outside of the 'if' block to make it accessible
+selected_paths = []
 
 # Datei-Upload
 if mode == "Datei-Upload (ZIP)":
@@ -347,7 +362,7 @@ elif mode == "Dropbox":
                         fit_columns_on_grid_load=True,
                         enable_enterprise_modules=False,
                         allow_unsafe_jscode=False,
-                        theme="streamlit"  # oder "alpine"
+                        theme="streamlit"
                     )
                     selected = grid.get("selected_rows", [])
                     selected_paths = [r["path_lower"] for r in selected] if selected else []
