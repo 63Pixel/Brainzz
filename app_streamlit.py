@@ -372,22 +372,20 @@ elif mode == 'Dropbox':
             dbx = dropbox.Dropbox(token, timeout=300)
 
             # probe_candidates tries several possible API paths until one works
-          from dropbox.exceptions import ApiError
-
 def probe_candidates(dbx, configured):
     """
     Versucht mehrere Kandidaten für den API-Pfad.
     Liefert (api_path, entries) oder (None, []) wenn nichts passt.
-    WICHTIG: api_path ist entweder '' (app-root) oder ein String, der mit '/' beginnt.
+    Wichtig: api_path ist entweder '' (app-root) oder ein String, der mit '/' beginnt.
     """
     candidates = []
-    candidates.append(configured)                      # was in st.secrets steht
+    candidates.append(configured)
     if configured and configured.startswith('/'):
-        candidates.append(configured.lstrip('/'))     # ohne führenden Slash (falls user das angegeben hat)
+        candidates.append(configured.lstrip('/'))
     # try app-root and explicit root
-    candidates.append('')                              # app-root (Dropbox API erwartet '')
-    candidates.append('/')                             # full-root (will normalisiert werden)
-    # try last path segment
+    candidates.append('')
+    candidates.append('/')
+    # try last path segment only
     if configured and '/' in configured.strip('/'):
         parts = configured.strip('/').split('/')
         candidates.append('/' + parts[-1])
@@ -395,13 +393,13 @@ def probe_candidates(dbx, configured):
 
     tried = set()
     for cand in candidates:
-        # normalize to what Dropbox API accepts:
+        # normalize to Dropbox API format: '' (app-root) or path starting with '/'
         if cand is None:
             api_p = ''
         else:
             s = str(cand).strip()
             if s == '/' or s == '':
-                api_p = ''     # app-root for Dropbox API
+                api_p = ''    # app-root for Dropbox API
             else:
                 api_p = s if s.startswith('/') else '/' + s
 
@@ -416,7 +414,7 @@ def probe_candidates(dbx, configured):
             # ignore and try next candidate
             continue
         except Exception:
-            # any other unexpected error -> continue trying
+            # unexpected error, try next candidate as well
             continue
 
     return None, []
