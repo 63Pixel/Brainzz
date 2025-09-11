@@ -373,39 +373,51 @@ elif mode == 'Dropbox':
 
             # probe_candidates tries several possible API paths until one works
             def probe_candidates(dbx, configured):
-                candidates = []
-                # prefer what user configured
-                candidates.append(configured)
-                # if configured startswith '/', try without leading slash
-                if configured and configured.startswith('/'):
-                    candidates.append(configured.lstrip('/'))
-                # try app-root (empty string) and full-root
-                candidates.append('')
-                candidates.append('/')
-                # also try last path segment only
-                if configured and '/' in configured.strip('/'):
-                    parts = configured.strip('/').split('/')
-                    candidates.append('/' + parts[-1])
-                    candidates.append(parts[-1])
+    """
+    Versucht mehrere Kandidaten für den API-Pfad.
+    Liefert (api_path, entries) oder (None, []) wenn nichts passt.
+    WICHTIG: api_path ist entweder '' (app-root) oder ein String, der mit '/' beginnt.
+    """
+    candidates = []
+    candidates.append(configured)                      # was in st.secrets steht
+    if configured and configured.startswith('/'):
+        candidates.append(configured.lstrip('/'))     # ohne führenden Slash (falls user das angegeben hat)
+    # try app-root and explicit root
+    candidates.append('')                              # app-root (Dropbox API erwartet '')
+    candidates.append('/')                             # full-root (will normalisiert werden)
+    # try last path segment
+    if configured and '/' in configured.strip('/'):
+        parts = configured.strip('/').split('/')
+        candidates.append('/' + parts[-1])
+        candidates.append(parts[-1])
 
-                seen = []
-                for cand in candidates:
-                    api_p = '' if cand in ('', '/') or cand is None else cand
-                    if api_p in seen:
-                        continue
-                    seen.append(api_p)
-                    try:
-                        res = dbx.files_list_folder(api_p, recursive=False)
-                        return api_p, res.entries
-                    except ApiError as e:
-                        # if missing_scope propagate, else continue
-                        try:
-                            if isinstance(e.error, AuthError) or (hasattr(e, 'error') and getattr(e.error, 'is_path', lambda: False)()):
-                                pass
-                        except Exception:
-                            pass
-                        continue
-                return None, []
+    tried = set()
+    for cand in candidates:
+        # normalize to what Dropbox API accepts:
+        if cand is None:
+            api_p = ''
+        else:
+            s = str(cand).strip()
+            if s == '/' or s == '':
+                api_p = ''     # app-root for Dropbox API
+            else:
+                api_p = s if s.startswith('/') else '/' + s
+
+        if api_p in tried:
+            continue
+        tried.add(api_p)
+
+        try:
+            res = dbx.files_list_folder(api_p, recursive=False)
+            return api_p, res.entries
+        except ApiError:
+            # ignore and try next candidate
+            continue
+        except Exception:
+            # any other unexpected error -> continue trying
+            continue
+
+    return None, []
 
             if st.button('Ordner öffnen'):
                 api_path, entries = probe_candidates(dbx, configured_path)
