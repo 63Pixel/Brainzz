@@ -449,8 +449,6 @@ if not df_show.empty:
 
 # ---------- 4) Export (PNG) – unabhängig, Charts bleiben stehen ----------
 st.subheader("Export")
-st.caption(f"Kaleido installiert: {HAS_KALEIDO}")
-
 if df_show.empty:
     st.info("Keine Auswertung im Speicher. Erst „Auswertung starten“.")
 else:
@@ -476,7 +474,7 @@ else:
 
     if st.session_state.get("render_path") and os.path.isfile(st.session_state["render_path"]):
         p = st.session_state["render_path"]
-        st.image(p, caption="Rendering-Vorschau (PNG)", use_column_width=True)
+        st.image(p, caption="Rendering-Vorschau (PNG)", use_container_width=True)
         with open(p, "rb") as f:
             st.download_button("PNG herunterladen", f, file_name=os.path.basename(p), mime="image/png")
 
