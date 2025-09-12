@@ -1,6 +1,6 @@
-streamlit>=1.10.0
+streamlit
 pandas
 numpy
-plotly>=5.0.0
-scipy
+plotly
 kaleido>=0.2
+scipy    # optional für Preprocessing
