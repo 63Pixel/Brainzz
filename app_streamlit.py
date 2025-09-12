@@ -347,31 +347,42 @@ if st.button("Auswertung starten"):
                 st.subheader("Tabelle")
                 st.dataframe(df.round(4))
 
-            # ---- Export hübsches Rendering (PNG/SVG mit Kaleido) ----
-            with st.expander("Export: Schönes Rendering als Bild", expanded=False):
-                render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"])
-                as_svg      = st.checkbox("Auch als SVG speichern", value=True)
-                if st.button("Rendering erzeugen und speichern"):
-                    kind = "stress_relax" if "Stress" in render_kind else "bands"
-                    fig  = make_beauty_figure(df, kind=kind, smooth=smooth)
+           # ---- Export hübsches Rendering (nur PNG, robust via Session-State) ----
+with st.expander("Export: Schönes Rendering als Bild", expanded=True):
+    render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
+    # Button setzt nur den Trigger; Render passiert nach dem Rerun unten
+    if st.button("Rendering erzeugen und speichern", key="render_btn"):
+        st.session_state["_do_render"] = True
 
-                    outdir = os.path.join(workdir, "exports")
-                    os.makedirs(outdir, exist_ok=True)
-                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
+# Ausführung NACH dem UI-Aufbau, damit der Trigger einen Rerun überlebt
+if st.session_state.get("_do_render") and not df.empty:
+    try:
+        kind = "stress_relax" if "Stress" in st.session_state.get("render_kind","Stress") else "bands"
+        fig  = make_beauty_figure(df, kind=kind, smooth=smooth)
 
-                    # benötigt: requirements -> kaleido
-                    fig.write_image(png_path, width=1600, height=900, scale=3)
-                    st.success(f"Gespeichert: {png_path}")
-                    st.image(png_path, caption="Vorschau", use_column_width=True)
-                    with open(png_path, "rb") as f:
-                        st.download_button("PNG herunterladen", f, file_name=os.path.basename(png_path), mime="image/png")
+        outdir = os.path.join(workdir, "exports")
+        os.makedirs(outdir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
 
-                    if as_svg:
-                        svg_path = os.path.join(outdir, f"render_{kind}_{ts}.svg")
-                        fig.write_image(svg_path, width=1600, height=900)
-                        with open(svg_path, "rb") as f:
-                            st.download_button("SVG herunterladen", f, file_name=os.path.basename(svg_path), mime="image/svg+xml")
+        # Benötigt kaleido
+        fig.write_image(png_path, width=1600, height=900, scale=3)
+
+        st.success(f"Gespeichert: {png_path}")
+        st.image(png_path, caption="Vorschau", use_column_width=True)
+        with open(png_path, "rb") as f:
+            st.download_button("PNG herunterladen", f, file_name=os.path.basename(png_path), mime="image/png")
+
+        # optional: Merker des letzten Exports
+        st.session_state["_last_render"] = png_path
+
+    except Exception as e:
+        st.error(f"Rendering-Fehler: {type(e).__name__}: {e}\n"
+                 "Tipp: In requirements.txt 'kaleido>=0.2' eintragen und neu starten.")
+    finally:
+        # Trigger zurücksetzen, sonst würde bei jedem Rerun erneut gerendert
+        st.session_state["_do_render"] = False
+
 
             # Export der numerischen Summary
             df_out = df.copy()
