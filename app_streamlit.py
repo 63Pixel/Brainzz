@@ -86,23 +86,15 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     proc.to_csv(outp, index=False)
     return outp, True
 
-def load_session_relatives(csv_path, agg: str = "power"):
-    """
-    Aggregiert Bandspalten robust:
-    - aggregiert Kanäle per Mittelwert
-    - bei Vorzeichenwerten -> auf Leistung (x**2) oder Betrag umstellen
-    - normalisiert pro Zeile auf Summe 1
-    agg: "power" (Standard) oder "abs"
-    """
+def load_session_relatives(csv_path, agg="power"):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
         return None
 
-    bands = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
+    bands = ["Delta","Theta","Alpha","Beta","Gamma"]
     cols = {
-        b: [c for c in df.columns if str(c).startswith(f"{b}_")]
-           or ([b] if b in df.columns else [])
+        b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else [])
         for b in bands
     }
     if not all(cols[b] for b in bands):
@@ -112,26 +104,19 @@ def load_session_relatives(csv_path, agg: str = "power"):
     for b in bands:
         try:
             val = df[cols[b]].apply(pd.to_numeric, errors="coerce")
-
-            # Amplituden mit Vorzeichen → auf nichtnegative Größe bringen
             if agg == "abs":
                 val = val.abs()
-            else:
-                # "power": bei negativen Werten quadrieren
-                if (val < 0).any().any():
-                    val = val.pow(2)
-
-            # über Kanäle mitteln, damit viele Kanäle kein Bias geben
-            out[b.lower()] = val.mean(axis=1)
+            elif (val < 0).any().any():
+                val = val.pow(2)  # „power“-Aggregation bei Vorzeichenwerten
+            out[b.lower()] = val.mean(axis=1)  # Kanäle mitteln
         except Exception:
             return None
 
     rel = pd.DataFrame(out).replace([np.inf, -np.inf], np.nan).dropna()
     rel = rel.clip(lower=0)
-
     tot = rel.sum(axis=1).replace(0, np.nan)
-    rel = rel.div(tot, axis=0).dropna()
-    return rel
+    return rel.div(tot, axis=0).dropna()
+
 
 
 
