@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# EEG-Auswertung – Upload, Auswertung, stabile Anzeige, PNG-Rendering (Plotly→Kaleido, Fallback Matplotlib)
-# Fix: Charts verschwinden nicht mehr dank Session-State-Caching.
+# EEG-Auswertung – Upload, Auswertung, persistente Charts, PNG-Rendering (Plotly→Kaleido, Fallback Matplotlib)
 
 import os, re, glob, zipfile, tempfile, shutil
 from datetime import datetime
@@ -68,6 +67,7 @@ def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     return filtfilt(b,a,x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
+    """Filter nur, wenn KEINE fertigen Bandspalten vorliegen."""
     try: df = pd.read_csv(csv_path, low_memory=False)
     except Exception: return csv_path, False
     band_prefixes = ("Delta_","Theta_","Alpha_","Beta_","Gamma_")
@@ -87,6 +87,7 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     return outp, True
 
 def load_session_relatives(csv_path):
+    """Erwartet Delta_*, Theta_*, Alpha_*, Beta_*, Gamma_* oder einzelne Delta/…"""
     try: df = pd.read_csv(csv_path, low_memory=False)
     except Exception: return None
     bands = ["Delta","Theta","Alpha","Beta","Gamma"]
@@ -128,7 +129,7 @@ def recursively_extract_archives(root_dir):
                 continue
 
 
-# ---------- Plotly Anzeigen (interaktiv) ----------
+# ---------- Interaktive Plotly-Anzeigen ----------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
             "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
@@ -161,14 +162,15 @@ def plot_bands(df, smooth=5):
                               "beta_trend","gamma_trend","stresswave_trend","relaxwave_trend"],
                   var_name="Band", value_name="Wert")
     mapn = {"delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta",
-            "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)","relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
+            "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)",
+            "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
     long["Band"] = long["Band"].map(mapn)
     fig = px.line(long, x="date_str", y="Wert", color="Band", markers=True, height=380)
     fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0,1]))
     return fig
 
 
-# ---------- „Schönes Rendering“ (Plotly mit Punkt-Schatten, für PNG) ----------
+# ---------- „Schönes Rendering“ (Plotly mit Punkt-Schatten) ----------
 def make_beauty_figure(df, kind="stress_relax", smooth=5):
     x = df["date_str"]
     fig = go.Figure()
@@ -180,42 +182,29 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
         d["stress_std"]   = d["stress"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
         d["relax_std"]    = d["relax"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
 
-        # Stress-Band
+        # Stress-Band + Schattenpunkte + Linie
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] + d["stress_std"], line=dict(width=0),
                                  hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] - d["stress_std"], fill='tonexty',
                                  fillcolor='rgba(220,70,70,0.18)', line=dict(width=0),
                                  name="Stress Band", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], mode="markers", hoverinfo="skip", showlegend=False,
+                                 marker=dict(size=14, color="rgba(0,0,0,0.20)")))
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], name="Stress (Trend)", mode="lines+markers",
+                                 line=dict(color='rgb(220,70,70)', width=4),
+                                 marker=dict(size=7, color='rgb(220,70,70)')))
 
-        # Stress Schattenpunkte
-        fig.add_trace(go.Scatter(
-            x=x, y=d["stress_trend"], mode="markers", hoverinfo="skip", showlegend=False,
-            marker=dict(size=14, color="rgba(0,0,0,0.20)")
-        ))
-        # Stress Linie + Marker
-        fig.add_trace(go.Scatter(
-            x=x, y=d["stress_trend"], name="Stress (Trend)",
-            mode="lines+markers", line=dict(color='rgb(220,70,70)', width=4),
-            marker=dict(size=7, color='rgb(220,70,70)')
-        ))
-
-        # Relax-Band
+        # Relax-Band + Schattenpunkte + Linie
         fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] + d["relax_std"], line=dict(width=0),
                                  hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] - d["relax_std"], fill='tonexty',
                                  fillcolor='rgba(70,170,70,0.18)', line=dict(width=0),
                                  name="Entspannung Band", hoverinfo="skip"))
-        # Relax Schattenpunkte
-        fig.add_trace(go.Scatter(
-            x=x, y=d["relax_trend"], mode="markers", hoverinfo="skip", showlegend=False,
-            marker=dict(size=14, color="rgba(0,0,0,0.20)")
-        ))
-        # Relax Linie + Marker
-        fig.add_trace(go.Scatter(
-            x=x, y=d["relax_trend"], name="Entspannung (Trend)",
-            mode="lines+markers", line=dict(color='rgb(70,170,70)', width=4),
-            marker=dict(size=7, color='rgb(70,170,70)')
-        ))
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"], mode="markers", hoverinfo="skip", showlegend=False,
+                                 marker=dict(size=14, color="rgba(0,0,0,0.20)")))
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"], name="Entspannung (Trend)", mode="lines+markers",
+                                 line=dict(color='rgb(70,170,70)', width=4),
+                                 marker=dict(size=7, color='rgb(70,170,70)')))
 
         fig.update_layout(height=640, margin=dict(l=40,r=20,t=60,b=60),
                           title="Stress- und Entspannungs-Trend",
@@ -236,14 +225,11 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
             "gamma_trend":  ("Gamma",  "rgb(220,20,60)"),
         }
         for key,(label,color) in palette.items():
-            fig.add_trace(go.Scatter(
-                x=x, y=d[key], mode="markers", hoverinfo="skip", showlegend=False,
-                marker=dict(size=12, color="rgba(0,0,0,0.18)")
-            ))
-            fig.add_trace(go.Scatter(
-                x=x, y=d[key], name=label, mode="lines+markers",
-                line=dict(color=color, width=3.5), marker=dict(size=6, color=color)
-            ))
+            fig.add_trace(go.Scatter(x=x, y=d[key], mode="markers", hoverinfo="skip", showlegend=False,
+                                     marker=dict(size=12, color="rgba(0,0,0,0.18)")))
+            fig.add_trace(go.Scatter(x=x, y=d[key], name=label, mode="lines+markers",
+                                     line=dict(color=color, width=3.5),
+                                     marker=dict(size=6, color=color)))
 
         fig.update_layout(height=640, margin=dict(l=40,r=20,t=60,b=60),
                           title="EEG-Bänder (Trendlinien)",
@@ -254,7 +240,7 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
     raise ValueError("Unknown kind")
 
 
-# ---------- Matplotlib-Fallback-Rendering (mit Punkt-Schatten) ----------
+# ---------- Matplotlib-Fallback-Rendering mit Punkt-Schatten ----------
 def render_png_matplotlib(df, kind="stress_relax", smooth=5, outpath="render.png"):
     plt.style.use("seaborn-v0_8-darkgrid")
     fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
@@ -281,7 +267,9 @@ def render_png_matplotlib(df, kind="stress_relax", smooth=5, outpath="render.png
         ax.plot(x, d["relax_trend"],  c=(0.27,0.67,0.27), lw=3.5, zorder=3)
         ax.scatter(x, d["relax_trend"],  s=60, c=(0.27,0.67,0.27), zorder=4, label="Entspannung (Trend)")
 
-        ax.set_ylabel("Index"); ax.set_title("Stress- und Entspannungs-Trend"); ax.legend(loc="best")
+        ax.set_ylabel("Index")
+        ax.set_title("Stress- und Entspannungs-Trend")
+        ax.legend(loc="best")
 
     elif kind == "bands":
         d = df.copy()
@@ -300,20 +288,20 @@ def render_png_matplotlib(df, kind="stress_relax", smooth=5, outpath="render.png
             ax.plot(x, y, lw=3, c=col, zorder=3, label=label)
             ax.scatter(x, y, s=48, c=col, zorder=4)
 
-        ax.set_ylim(0,1); ax.set_ylabel("Relativer Anteil"); ax.set_title("EEG-Bänder (Trendlinien)"); ax.legend(loc="best")
+        ax.set_ylim(0,1)
+        ax.set_ylabel("Relativer Anteil")
+        ax.set_title("EEG-Bänder (Trendlinien)")
+        ax.legend(loc="best")
 
-    ax.set_xticks(x); ax.set_xticklabels(xticks, rotation=45, ha="right")
-    fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
+    ax.set_xticks(x)
+    ax.set_xticklabels(xticks, rotation=45, ha="right")
+    fig.tight_layout()
+    fig.savefig(outpath, bbox_inches="tight")
+    plt.close(fig)
     return outpath
 
 
-def ensure_exports_dir():
-    outdir = os.path.join(workdir, "exports")
-    os.makedirs(outdir, exist_ok=True)
-    return outdir
-
-
-# ---------- Chart-Cache ----------
+# ---------- Chart-Baukasten + Cache ----------
 def build_charts(df: pd.DataFrame, smooth: int):
     charts = {}
     if len(df) == 1:
@@ -328,7 +316,8 @@ def build_charts(df: pd.DataFrame, smooth: int):
 st.subheader("1) Datei-Upload")
 uploads = st.file_uploader(
     "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
-    type=["zip","sip","csv"], accept_multiple_files=True
+    type=["zip","sip","csv"],
+    accept_multiple_files=True
 )
 if uploads:
     imported, extracted = 0, 0
@@ -352,16 +341,13 @@ if uploads:
 # ---------- 2) Parameter / QC ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
-    st.markdown("**Glättungsfenster**: Sessions für Trend-Glättung (3–7).  \n**Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.")
+    st.markdown("""
+**Glättungsfenster**: Sessions für Trend-Glättung (3–7).  
+**Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.
+""")
 smooth = st.slider("Glättungsfenster (Sessions)", 3, 11, 5, 2)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
-
-# Wenn Glättung geändert wurde, Charts neu bauen
-if "df_summary" in st.session_state and isinstance(st.session_state["df_summary"], pd.DataFrame) and not st.session_state["df_summary"].empty:
-    if st.session_state.get("last_smooth") != smooth:
-        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth)
-        st.session_state["last_smooth"] = smooth
 
 # CSV-Überblick
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir,"**","*.csv"), recursive=True)]
@@ -369,8 +355,14 @@ n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all)/(1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
 
+# Wenn Slider geändert → Charts neu aufbauen
+if "df_summary" in st.session_state and not st.session_state["df_summary"].empty:
+    if st.session_state.get("last_smooth") != smooth:
+        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth)
+        st.session_state["last_smooth"] = smooth
 
-# ---------- 3) Auswertung starten → Daten berechnen + persistieren + Charts cachen ----------
+
+# ---------- 3) Auswertung: Daten berechnen + persistieren ----------
 if st.button("Auswertung starten"):
     recursively_extract_archives(workdir)
     selected_csvs = [p for p in glob.glob(os.path.join(workdir,"**","*.csv"), recursive=True)]
@@ -412,10 +404,12 @@ if st.button("Auswertung starten"):
         else:
             df = df.sort_values("datetime").reset_index(drop=True)
             df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
+
+            # Persistieren
             st.session_state["df_summary"] = df.copy()
-            # Charts cachen
             st.session_state["last_smooth"] = smooth
             st.session_state["charts"] = build_charts(df, smooth)
+
             st.success(f"{len(df)} Session(s) ausgewertet. Anzeige unten aktualisiert.")
         if failed:
             st.subheader("Übersprungene Dateien")
@@ -423,14 +417,14 @@ if st.button("Auswertung starten"):
                 st.warning(f"{f['source']}: {f['reason']}")
 
 
-# ---------- 3b) Stabile Anzeige aus dem Cache ----------
+# ---------- 3b) Stabile Anzeige: immer aus Session-State ----------
 df_show = st.session_state.get("df_summary", pd.DataFrame())
 charts  = st.session_state.get("charts", {})
 
 if not df_show.empty:
     if len(df_show)==1:
-        fig = charts.get("single") or plot_single_session_interactive(df_show)
         st.subheader("Einzel-Session")
+        fig = charts.get("single") or plot_single_session_interactive(df_show)
         st.plotly_chart(fig, use_container_width=True)
         st.dataframe(df_show.round(4))
     else:
@@ -444,6 +438,13 @@ if not df_show.empty:
 
         st.subheader("Tabelle")
         st.dataframe(df_show.round(4))
+
+    # Download Summary
+    df_out = df_show.copy()
+    df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    st.download_button("Summary CSV herunterladen",
+                       data=df_out.to_csv(index=False).encode("utf-8"),
+                       file_name="summary_indices.csv", mime="text/csv")
 
 
 # ---------- 4) Export (PNG) – unabhängig, Charts bleiben stehen ----------
@@ -460,7 +461,7 @@ else:
 
     if render_btn:
         kind = "stress_relax" if "Stress" in render_kind else "bands"
-        outdir = ensure_exports_dir()
+        outdir = os.path.join(workdir, "exports"); os.makedirs(outdir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
         try:
@@ -485,6 +486,6 @@ with st.expander("Debug / Wartung", expanded=False):
     if st.button("Arbeitsordner leeren"):
         try: shutil.rmtree(st.session_state["workdir"])
         except Exception: pass
-        for k in ["workdir","df_summary","charts","last_smooth","render_path"]:
+        for k in ["workdir","df_summary","charts","render_path","last_smooth"]:
             st.session_state.pop(k, None)
         st.success("Arbeitsordner geleert. Seite neu laden.")
