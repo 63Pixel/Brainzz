@@ -86,38 +86,53 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     proc.to_csv(outp, index=False)
     return outp, True
 
-def load_session_relatives(csv_path):
-    """Erwartet Delta_*, Theta_*, Alpha_*, Beta_*, Gamma_* oder einzelne Delta/…"""
-    try: df = pd.read_csv(csv_path, low_memory=False)
-    except Exception: return None
-    bands = ["Delta","Theta","Alpha","Beta","Gamma"]
-    cols = {b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else []) for b in bands}
-    if not all(cols[b] for b in bands): return None
-    sums = {}
-for b in bands:
+def load_session_relatives(csv_path, agg: str = "power"):
+    """
+    Aggregiert Bandspalten robust:
+    - aggregiert Kanäle per Mittelwert
+    - bei Vorzeichenwerten -> auf Leistung (x**2) oder Betrag umstellen
+    - normalisiert pro Zeile auf Summe 1
+    agg: "power" (Standard) oder "abs"
+    """
     try:
-        val = df[cols[b]].apply(pd.to_numeric, errors="coerce")
-
-        # negative Werte -> Amplituden: auf Leistung/Betrag gehen
-        if (val < 0).any().any():
-            # wähle EINE der beiden Zeilen – Betrag ist unkritischer,
-            # Leistung (quadrieren) ist „physikalischer“:
-            # val = val.abs()
-            val = val.pow(2)
-
-        # über Kanäle mitteln, damit viele Kanäle kein Bias geben
-        band_series = val.mean(axis=1)
-        sums[b.lower()] = band_series
+        df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
         return None
 
-rel = pd.DataFrame(sums).replace([np.inf, -np.inf], np.nan).dropna()
-# Negatives sicherheitshalber hart auf 0 kappen
-rel = rel.clip(lower=0)
+    bands = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
+    cols = {
+        b: [c for c in df.columns if str(c).startswith(f"{b}_")]
+           or ([b] if b in df.columns else [])
+        for b in bands
+    }
+    if not all(cols[b] for b in bands):
+        return None
 
-tot = rel.sum(axis=1).replace(0, np.nan)
-rel = rel.div(tot, axis=0).dropna()
-return rel
+    out = {}
+    for b in bands:
+        try:
+            val = df[cols[b]].apply(pd.to_numeric, errors="coerce")
+
+            # Amplituden mit Vorzeichen → auf nichtnegative Größe bringen
+            if agg == "abs":
+                val = val.abs()
+            else:
+                # "power": bei negativen Werten quadrieren
+                if (val < 0).any().any():
+                    val = val.pow(2)
+
+            # über Kanäle mitteln, damit viele Kanäle kein Bias geben
+            out[b.lower()] = val.mean(axis=1)
+        except Exception:
+            return None
+
+    rel = pd.DataFrame(out).replace([np.inf, -np.inf], np.nan).dropna()
+    rel = rel.clip(lower=0)
+
+    tot = rel.sum(axis=1).replace(0, np.nan)
+    rel = rel.div(tot, axis=0).dropna()
+    return rel
+
 
 
 def _is_good_rel(df):
