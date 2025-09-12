@@ -1,6 +1,7 @@
 streamlit
 pandas
 numpy
+matplotlib
 plotly
 kaleido>=0.2
 scipy    # optional für Preprocessing
