@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# EEG-Auswertung – nur Datei-Upload mit schönem Rendering-Export
+# EEG-Auswertung – Datei-Upload + schönes PNG-Rendering
 
-import os, io, re, glob, zipfile, tempfile, shutil
+import os, re, glob, zipfile, tempfile, shutil
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -17,12 +17,17 @@ try:
 except Exception:
     HAS_SCIPY = False
 
+# optional (für PNG-Export)
+try:
+    import kaleido  # noqa: F401  # Plotly nutzt es intern
+    HAS_KALEIDO = True
+except Exception:
+    HAS_KALEIDO = False
 
 # ---------- Streamlit ----------
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
-st.caption("Datei-Upload (ZIP/SIP/CSV) → Entpacken → Auswertung → Export als PNG/SVG")
-
+st.caption("Datei-Upload (ZIP/SIP/CSV) → Entpacken → Auswertung → Export als PNG")
 
 # ---------- Persistentes Arbeitsverzeichnis ----------
 def get_workdir():
@@ -32,35 +37,42 @@ def get_workdir():
 
 workdir = get_workdir()
 
-
 # ---------- Helper ----------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path: str):
     m = PAT.search(path)
-    if not m: return None
-    try: return datetime.strptime(m.group(1), "%Y-%m-%d--%H-%M-%S")
-    except Exception: return None
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d--%H-%M-%S")
+    except Exception:
+        return None
 
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
-    if not HAS_SCIPY: return x
-    b,a = iirnotch(f0, Q, fs)
-    return filtfilt(b,a,x)
+    if not HAS_SCIPY:
+        return x
+    b, a = iirnotch(f0, Q, fs)
+    return filtfilt(b, a, x)
 
 def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
-    if not HAS_SCIPY: return x
-    nyq = fs/2.0
-    b,a = butter(order, [low/nyq, high/nyq], btype="band")
-    return filtfilt(b,a,x)
+    if not HAS_SCIPY:
+        return x
+    nyq = fs / 2.0
+    b, a = butter(order, [low / nyq, high / nyq], btype="band")
+    return filtfilt(b, a, x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     # Nur filtern, wenn KEINE fertigen Bandspalten vorliegen
-    try: df = pd.read_csv(csv_path, low_memory=False)
-    except Exception: return csv_path, False
+    try:
+        df = pd.read_csv(csv_path, low_memory=False)
+    except Exception:
+        return csv_path, False
     band_prefixes = ("Delta_","Theta_","Alpha_","Beta_","Gamma_")
     non_band = [c for c in df.columns if not str(c).startswith(band_prefixes)]
     numeric = [c for c in non_band if np.issubdtype(df[c].dtype, np.number)]
-    if len(numeric)<2 or len(df)<10 or not HAS_SCIPY or fs<=0: return csv_path, False
+    if len(numeric) < 2 or len(df) < 10 or not HAS_SCIPY or fs <= 0:
+        return csv_path, False
     proc = df.copy()
     for c in numeric:
         try:
@@ -68,27 +80,33 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
             sig = notch_filter_signal(sig, fs=fs)
             sig = bandpass_signal(sig, fs=fs)
             proc[c] = sig
-        except Exception: pass
-    outp = os.path.join(out_tmp_dir, os.path.basename(csv_path).replace(".csv","_proc.csv"))
+        except Exception:
+            pass
+    outp = os.path.join(out_tmp_dir, os.path.basename(csv_path).replace(".csv", "_proc.csv"))
     proc.to_csv(outp, index=False)
     return outp, True
 
 def load_session_relatives(csv_path):
-    try: df = pd.read_csv(csv_path, low_memory=False)
-    except Exception: return None
+    try:
+        df = pd.read_csv(csv_path, low_memory=False)
+    except Exception:
+        return None
     bands = ["Delta","Theta","Alpha","Beta","Gamma"]
     cols = {b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else []) for b in bands}
-    if not all(cols[b] for b in bands): return None
+    if not all(cols[b] for b in bands):
+        return None
     sums = {}
     for b in bands:
-        try: sums[b.lower()] = df[cols[b]].apply(pd.to_numeric, errors="coerce").sum(axis=1)
-        except Exception: return None
-    rel = pd.DataFrame(sums).replace([np.inf,-np.inf], np.nan).dropna()
-    tot = rel.sum(axis=1).replace(0,np.nan)
+        try:
+            sums[b.lower()] = df[cols[b]].apply(pd.to_numeric, errors="coerce").sum(axis=1)
+        except Exception:
+            return None
+    rel = pd.DataFrame(sums).replace([np.inf, -np.inf], np.nan).dropna()
+    tot = rel.sum(axis=1).replace(0, np.nan)
     return rel.div(tot, axis=0).dropna()
 
 def _is_good_rel(df):
-    return isinstance(df, pd.DataFrame) and not df.empty and \
+    return isinstance(df, pd.DataFrame) and (not df.empty) and \
            all(c in df.columns for c in ["alpha","beta","theta","delta","gamma"])
 
 def plot_single_session_interactive(df):
@@ -99,7 +117,7 @@ def plot_single_session_interactive(df):
     data = pd.DataFrame({"Metrik": list(vals.keys()), "Wert": list(vals.values())})
     fig = px.bar(data, x="Metrik", y="Wert", color="Metrik", text="Wert", height=320)
     fig.update_traces(texttemplate="%{text:.2f}", textposition="outside", showlegend=False)
-    fig.update_layout(margin=dict(l=10,r=10,t=30,b=10))
+    fig.update_layout(margin=dict(l=10, r=10, t=30, b=10))
     return fig
 
 def plot_stress_relax(df, smooth=5):
@@ -127,26 +145,31 @@ def plot_bands(df, smooth=5):
             "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
     long["Band"] = long["Band"].map(mapn)
     fig = px.line(long, x="date_str", y="Wert", color="Band", markers=True, height=380)
-    fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0,1]))
+    fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0, 1]))
     return fig
 
 def recursively_extract_archives(root_dir):
     changed = True
     while changed:
         changed = False
-        archives = [p for p in glob.glob(os.path.join(root_dir,"**","*"), recursive=True)
-                    if os.path.isfile(p) and p.lower().endswith((".zip",".sip"))]
+        archives = [p for p in glob.glob(os.path.join(root_dir, "**", "*"), recursive=True)
+                    if os.path.isfile(p) and p.lower().endswith((".zip", ".sip"))]
         for arch in archives:
-            if arch.endswith(".extracted"): continue
+            if arch.endswith(".extracted"):
+                continue
             try:
                 target = os.path.join(os.path.dirname(arch),
                                       os.path.splitext(os.path.basename(arch))[0] + "_extracted")
                 os.makedirs(target, exist_ok=True)
-                with zipfile.ZipFile(arch,"r") as zf: zf.extractall(target)
-                try: os.rename(arch, arch+".extracted")
+                with zipfile.ZipFile(arch, "r") as zf:
+                    zf.extractall(target)
+                try:
+                    os.rename(arch, arch + ".extracted")
                 except Exception:
-                    try: os.remove(arch)
-                    except Exception: pass
+                    try:
+                        os.remove(arch)
+                    except Exception:
+                        pass
                 changed = True
             except zipfile.BadZipFile:
                 continue
@@ -157,19 +180,22 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     rows, failed_files = [], []
     total = max(1, len(csv_paths))
     if st_container is not None:
-        progress = st_container.progress(0); status_text = st_container.empty()
+        progress = st_container.progress(0)
+        status_text = st_container.empty()
     for i, cp in enumerate(sorted(csv_paths), start=1):
         try:
             _ = pd.read_csv(cp, nrows=1)
         except Exception:
             failed_files.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
-            if st_container is not None: status_text.text(f"Skipping (no CSV): {os.path.basename(cp)}")
+            if st_container is not None:
+                status_text.text(f"Skipping (no CSV): {os.path.basename(cp)}")
             continue
 
         dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
         if dt is None:
             failed_files.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel im Namen."})
-            if st_container is not None: status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
+            if st_container is not None:
+                status_text.text(f"Skipping (no timestamp): {os.path.basename(cp)}")
             continue
 
         proc_path, did = preprocess_csv_if_raw(cp, tmpdir, fs=fs)
@@ -179,42 +205,40 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
         if not _is_good_rel(rel):
             failed_files.append({"source": os.path.basename(cp),
                                  "reason": "Keine gültigen Bandspalten (Delta/Theta/Alpha/Beta/Gamma)."})
-            if st_container is not None: status_text.text(f"Skipping (no bands): {os.path.basename(cp)}")
+            if st_container is not None:
+                status_text.text(f"Skipping (no bands): {os.path.basename(cp)}")
             continue
 
-        alpha, beta  = float(rel["alpha"].mean()), float(rel["beta"].mean())
+        alpha, beta = float(rel["alpha"].mean()), float(rel["beta"].mean())
         theta, delta = float(rel["theta"].mean()), float(rel["delta"].mean())
-        gamma        = float(rel["gamma"].mean())
+        gamma = float(rel["gamma"].mean())
         rows.append({
-            "datetime": dt, "alpha":alpha,"beta":beta,"theta":theta,"delta":delta,"gamma":gamma,
-            "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
+            "datetime": dt, "alpha": alpha, "beta": beta, "theta": theta, "delta": delta, "gamma": gamma,
+            "stress": beta / (alpha + 1e-9), "relax": alpha / (beta + 1e-9), "source": os.path.basename(cp)
         })
         if st_container is not None:
-            progress.progress(int(i/total*100))
+            progress.progress(int(i / total * 100))
             status_text.text(f"Processed {i}/{total}: {os.path.basename(cp)}")
     if st_container is not None:
-        progress.empty(); status_text.empty()
+        progress.empty()
+        status_text.empty()
     df = pd.DataFrame(rows)
     if not df.empty:
         df = df.sort_values("datetime").reset_index(drop=True)
         df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
     return df, failed_files
 
-
-# ---------- Schönes Rendering (PNG/SVG) ----------
 def make_beauty_figure(df, kind="stress_relax", smooth=5):
     x = df["date_str"]
-
     if kind == "stress_relax":
         d = df.copy()
         d["stress_trend"] = d["stress"].rolling(smooth, center=True, min_periods=1).mean()
-        d["relax_trend"]  = d["relax"].rolling(smooth, center=True, min_periods=1).mean()
-        d["stress_std"]   = d["stress"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
-        d["relax_std"]    = d["relax"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
+        d["relax_trend"] = d["relax"].rolling(smooth, center=True, min_periods=1).mean()
+        d["stress_std"] = d["stress"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
+        d["relax_std"] = d["relax"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
 
         fig = go.Figure()
-
-        # Stress-Band (Schattierung)
+        # Stress-Band
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] + d["stress_std"],
                                  line=dict(width=0), hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] - d["stress_std"],
@@ -224,7 +248,6 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
                                  line=dict(color='rgb(220,70,70)', width=4),
                                  name="Stress (Trend)", mode="lines+markers",
                                  marker=dict(size=6)))
-
         # Relax-Band
         fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] + d["relax_std"],
                                  line=dict(width=0), hoverinfo="skip", showlegend=False))
@@ -235,47 +258,42 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
                                  line=dict(color='rgb(70,170,70)', width=4),
                                  name="Entspannung (Trend)", mode="lines+markers",
                                  marker=dict(size=6)))
-
-        fig.update_layout(height=640, margin=dict(l=40,r=20,t=60,b=60),
+        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
                           title="Stress- und Entspannungs-Trend mit Schattierung",
                           xaxis=dict(type="category", tickangle=45, title="Datum"),
                           yaxis=dict(title="Index"))
         return fig
 
-    elif kind == "bands":
+    if kind == "bands":
         d = df.copy()
-        for c in ["delta","theta","alpha","beta","gamma"]:
+        for c in ["delta", "theta", "alpha", "beta", "gamma"]:
             d[f"{c}_trend"] = d[c].rolling(smooth, center=True, min_periods=1).mean()
-
         fig = go.Figure()
         palette = {
-            "delta_trend":  "rgb(100,149,237)",  # cornflowerblue
-            "theta_trend":  "rgb(72,61,139)",    # darkslateblue
-            "alpha_trend":  "rgb(34,139,34)",    # forestgreen
-            "beta_trend":   "rgb(255,165,0)",    # orange
-            "gamma_trend":  "rgb(220,20,60)",    # crimson
+            "delta_trend": "rgb(100,149,237)",
+            "theta_trend": "rgb(72,61,139)",
+            "alpha_trend": "rgb(34,139,34)",
+            "beta_trend": "rgb(255,165,0)",
+            "gamma_trend": "rgb(220,20,60)",
         }
-        for key,color in palette.items():
+        for key, color in palette.items():
             fig.add_trace(go.Scatter(
-                x=x, y=d[key], name=key.replace("_trend","").capitalize(),
+                x=df["date_str"], y=d[key], name=key.replace("_trend", "").capitalize(),
                 line=dict(color=color, width=4), mode="lines"
             ))
-        fig.update_layout(height=640, margin=dict(l=40,r=20,t=60,b=60),
+        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
                           title="EEG-Bänder (Trendlinien)",
                           xaxis=dict(type="category", tickangle=45, title="Datum"),
-                          yaxis=dict(title="Relativer Anteil", range=[0,1]))
+                          yaxis=dict(title="Relativer Anteil", range=[0, 1]))
         return fig
 
-    else:
-        raise ValueError("Unknown kind")
-
+    raise ValueError("Unknown kind")
 
 # ---------- 1) Datei-Upload ----------
 st.subheader("1) Datei-Upload")
-
 uploads = st.file_uploader(
     "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
-    type=["zip","sip","csv"],
+    type=["zip", "sip", "csv"],
     accept_multiple_files=True
 )
 if uploads:
@@ -286,7 +304,7 @@ if uploads:
         with open(local_path, "wb") as f:
             f.write(up.getbuffer())
         imported += 1
-        if fname.lower().endswith((".zip",".sip")):
+        if fname.lower().endswith((".zip", ".sip")):
             try:
                 with zipfile.ZipFile(local_path, "r") as zf:
                     zf.extractall(os.path.join(workdir, os.path.splitext(fname)[0] + "_extracted"))
@@ -296,31 +314,28 @@ if uploads:
     recursively_extract_archives(workdir)
     st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
 
-
 # ---------- 2) Parameter / QC ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
 **Glättungsfenster**: Sessions für Trend-Glättung (3–7).  
 **Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.  
-**Export**: Unten kannst du ein gerendertes PNG/SVG erzeugen.
+**Export**: Unten erzeugst du ein gerendertes PNG.
 """)
 smooth = st.slider("Glättungsfenster (Sessions)", 3, 11, 5, 2)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
 
-
-# Überblick über CSVs im Workdir
-csv_paths_all = [p for p in glob.glob(os.path.join(workdir,"**","*.csv"), recursive=True)]
+# ---------- Überblick CSVs ----------
+csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
 n_csv = len(csv_paths_all)
-total_mb = sum(os.path.getsize(p) for p in csv_paths_all)/(1024*1024) if n_csv>0 else 0.0
+total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024 * 1024) if n_csv > 0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
 
-
 # ---------- 3) Auswertung ----------
-if st.button("Auswertung starten"):
+if st.button("Auswertung starten", key="run"):
     recursively_extract_archives(workdir)
-    selected_csvs = [p for p in glob.glob(os.path.join(workdir,"**","*.csv"), recursive=True)]
+    selected_csvs = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
     st.info(f"Endgültige Anzahl zu verarbeitender Sessions: {len(selected_csvs)}")
 
     if not selected_csvs:
@@ -331,11 +346,13 @@ if st.button("Auswertung starten"):
         df, failed_files = build_session_table_from_list(
             selected_csvs, tmpdir, fs=(fs if do_preproc else 0.0), st_container=container
         )
-        try: shutil.rmtree(tmpdir)
-        except Exception: pass
+        try:
+            shutil.rmtree(tmpdir)
+        except Exception:
+            pass
 
         if not df.empty:
-            if len(df)==1:
+            if len(df) == 1:
                 st.subheader("Einzel-Session")
                 st.plotly_chart(plot_single_session_interactive(df), use_container_width=True)
                 st.dataframe(df.round(4))
@@ -347,42 +364,29 @@ if st.button("Auswertung starten"):
                 st.subheader("Tabelle")
                 st.dataframe(df.round(4))
 
-           # ---- Export hübsches Rendering (nur PNG, robust via Session-State) ----
-with st.expander("Export: Schönes Rendering als Bild", expanded=True):
-    render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
-    # Button setzt nur den Trigger; Render passiert nach dem Rerun unten
-    if st.button("Rendering erzeugen und speichern", key="render_btn"):
-        st.session_state["_do_render"] = True
-
-# Ausführung NACH dem UI-Aufbau, damit der Trigger einen Rerun überlebt
-if st.session_state.get("_do_render") and not df.empty:
-    try:
-        kind = "stress_relax" if "Stress" in st.session_state.get("render_kind","Stress") else "bands"
-        fig  = make_beauty_figure(df, kind=kind, smooth=smooth)
-
-        outdir = os.path.join(workdir, "exports")
-        os.makedirs(outdir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
-
-        # Benötigt kaleido
-        fig.write_image(png_path, width=1600, height=900, scale=3)
-
-        st.success(f"Gespeichert: {png_path}")
-        st.image(png_path, caption="Vorschau", use_column_width=True)
-        with open(png_path, "rb") as f:
-            st.download_button("PNG herunterladen", f, file_name=os.path.basename(png_path), mime="image/png")
-
-        # optional: Merker des letzten Exports
-        st.session_state["_last_render"] = png_path
-
-    except Exception as e:
-        st.error(f"Rendering-Fehler: {type(e).__name__}: {e}\n"
-                 "Tipp: In requirements.txt 'kaleido>=0.2' eintragen und neu starten.")
-    finally:
-        # Trigger zurücksetzen, sonst würde bei jedem Rerun erneut gerendert
-        st.session_state["_do_render"] = False
-
+            # ---- Export hübsches Rendering (PNG mit Kaleido) ----
+            with st.expander("Export: Rendering als PNG", expanded=True):
+                motif = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="motif")
+                if st.button("Rendering erzeugen und speichern", key="render_png"):
+                    if not HAS_KALEIDO:
+                        st.error("Kaleido fehlt. Füge 'kaleido>=0.2' zur requirements.txt hinzu.")
+                    else:
+                        kind = "stress_relax" if "Stress" in motif else "bands"
+                        fig = make_beauty_figure(df, kind=kind, smooth=smooth)
+                        outdir = os.path.join(workdir, "exports")
+                        os.makedirs(outdir, exist_ok=True)
+                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
+                        try:
+                            fig.write_image(png_path, width=1600, height=900, scale=3)
+                            st.success(f"Gespeichert: {png_path}")
+                            st.image(png_path, caption="Vorschau", use_column_width=True)
+                            with open(png_path, "rb") as f:
+                                st.download_button("PNG herunterladen", f,
+                                                   file_name=os.path.basename(png_path),
+                                                   mime="image/png", key="dl_png")
+                        except Exception as e:
+                            st.error(f"Rendering fehlgeschlagen: {e}")
 
             # Export der numerischen Summary
             df_out = df.copy()
@@ -398,7 +402,7 @@ if st.session_state.get("_do_render") and not df.empty:
 
 # ---------- Wartung ----------
 with st.expander("Debug / Wartung", expanded=False):
-    if st.button("Arbeitsordner leeren"):
+    if st.button("Arbeitsordner leeren", key="clear"):
         try:
             shutil.rmtree(st.session_state["workdir"])
         except Exception:
