@@ -365,28 +365,77 @@ if st.button("Auswertung starten", key="run"):
                 st.dataframe(df.round(4))
 
             # ---- Export hübsches Rendering (PNG mit Kaleido) ----
-            with st.expander("Export: Rendering als PNG", expanded=True):
-                motif = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="motif")
-                if st.button("Rendering erzeugen und speichern", key="render_png"):
-                    if not HAS_KALEIDO:
-                        st.error("Kaleido fehlt. Füge 'kaleido>=0.2' zur requirements.txt hinzu.")
-                    else:
-                        kind = "stress_relax" if "Stress" in motif else "bands"
-                        fig = make_beauty_figure(df, kind=kind, smooth=smooth)
-                        outdir = os.path.join(workdir, "exports")
-                        os.makedirs(outdir, exist_ok=True)
-                        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
-                        try:
-                            fig.write_image(png_path, width=1600, height=900, scale=3)
-                            st.success(f"Gespeichert: {png_path}")
-                            st.image(png_path, caption="Vorschau", use_column_width=True)
-                            with open(png_path, "rb") as f:
-                                st.download_button("PNG herunterladen", f,
-                                                   file_name=os.path.basename(png_path),
-                                                   mime="image/png", key="dl_png")
-                        except Exception as e:
-                            st.error(f"Rendering fehlgeschlagen: {e}")
+            # ---------- 4) Export-Rendering (PNG) – unabhängig vom Auswertungs-Button ----------
+st.subheader("Export")
+df_render = st.session_state.get("df_summary", pd.DataFrame())
+
+# Diagnosezeile: zeigt, ob Kaleido verfügbar ist
+try:
+    import kaleido  # noqa: F401
+    HAS_KALEIDO = True
+except Exception:
+    HAS_KALEIDO = False
+st.caption(f"Kaleido installiert: {HAS_KALEIDO}")
+
+if df_render is None or df_render.empty:
+    st.info("Keine Auswertung im Speicher. Klicke zuerst auf „Auswertung starten“.")
+else:
+    render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
+    render_btn  = st.button("PNG rendern", key="render_btn")
+
+    st.session_state.setdefault("render_path", "")
+    st.session_state.setdefault("render_html_path", "")
+
+    if render_btn:
+        try:
+            if not HAS_KALEIDO:
+                raise RuntimeError("Kaleido nicht installiert. Füge `kaleido>=0.2` zu requirements.txt hinzu.")
+
+            kind = "stress_relax" if "Stress" in render_kind else "bands"
+            fig  = make_beauty_figure(df_render, kind=kind, smooth=smooth)
+
+            outdir = ensure_exports_dir()
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
+
+            import plotly.io as pio
+            pio.write_image(fig, png_path, width=1600, height=900, scale=3, engine="kaleido")
+
+            st.session_state["render_path"] = png_path
+            st.session_state["render_html_path"] = ""
+            st.success(f"PNG erzeugt: {png_path}")
+
+        except Exception as e:
+            # Fallback: HTML exportieren, damit du trotzdem etwas bekommst
+            try:
+                kind = "stress_relax" if "Stress" in render_kind else "bands"
+                fig  = make_beauty_figure(df_render, kind=kind, smooth=smooth)
+                outdir = ensure_exports_dir()
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                html_path = os.path.join(outdir, f"render_{kind}_{ts}.html")
+                import plotly.io as pio
+                pio.write_html(fig, file=html_path, include_plotlyjs="cdn", full_html=True)
+                st.session_state["render_html_path"] = html_path
+                st.session_state["render_path"] = ""
+                st.warning("PNG-Rendering fehlgeschlagen. HTML-Export wurde erzeugt (interaktiv). Details unten.")
+                st.exception(e)
+            except Exception as ee:
+                st.error("Rendering komplett fehlgeschlagen.")
+                st.exception(ee)
+
+    # Ergebnis anzeigen
+    if st.session_state.get("render_path") and os.path.isfile(st.session_state["render_path"]):
+        p = st.session_state["render_path"]
+        st.image(p, caption="Rendering-Vorschau (PNG)", use_column_width=True)
+        with open(p, "rb") as f:
+            st.download_button("PNG herunterladen", f, file_name=os.path.basename(p), mime="image/png")
+
+    if st.session_state.get("render_html_path") and os.path.isfile(st.session_state["render_html_path"]):
+        hp = st.session_state["render_html_path"]
+        st.info(f"HTML-Export: {hp}")
+        with open(hp, "rb") as f:
+            st.download_button("HTML herunterladen", f, file_name=os.path.basename(hp), mime="text/html")
+
 
             # Export der numerischen Summary
             df_out = df.copy()
