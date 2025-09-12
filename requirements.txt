@@ -3,3 +3,4 @@ pandas
 numpy
 plotly>=5.0.0
 scipy
+kaleido>=0.2
