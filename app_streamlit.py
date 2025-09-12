@@ -174,19 +174,55 @@ def plot_bands(df, smooth=5):
     d = df.copy()
     d["stresswave"] = d["beta"] + d["gamma"]
     d["relaxwave"]  = d["alpha"] + d["theta"]
-    for c in ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]:
-        d[f"{c}_trend"] = d[c].rolling(window=smooth, center=True, min_periods=1).mean()
-    long = d.melt(id_vars=["date_str"],
-                  value_vars=["delta_trend","theta_trend","alpha_trend",
-                              "beta_trend","gamma_trend","stresswave_trend","relaxwave_trend"],
-                  var_name="Band", value_name="Wert")
-    mapn = {"delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta",
-            "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)",
-            "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"}
-    long["Band"] = long["Band"].map(mapn)
+
+    # 1) Fenster kappen
+    win = max(1, min(int(smooth), len(d)))
+
+    cols = ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]
+    for c in cols:
+        d[f"{c}_trend"] = d[c].rolling(window=win, center=True, min_periods=1).mean()
+
+    # 2) Trendlinien
+    long = d.melt(
+        id_vars=["date_str"],
+        value_vars=[f"{c}_trend" for c in cols],
+        var_name="Band", value_name="Wert"
+    )
+    label_map = {
+        "delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha",
+        "beta_trend":"Beta","gamma_trend":"Gamma",
+        "stresswave_trend":"Stress-Welle (Beta+Gamma)",
+        "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"
+    }
+    long["Band"] = long["Band"].map(label_map)
+
+    import plotly.express as px, plotly.graph_objects as go
     fig = px.line(long, x="date_str", y="Wert", color="Band", markers=True, height=380)
-    fig.update_layout(xaxis=dict(type="category"), yaxis=dict(range=[0,1]))
+    fig.update_layout(xaxis=dict(type="category"))
+
+    # 3) Rohwerte als blasse Punkte
+    color_hint = {
+        "delta":"#1f77b4","theta":"#9467bd","alpha":"#2ca02c",
+        "beta":"#ff7f0e","gamma":"#d62728","stresswave":"#17becf","relaxwave":"#bcbd22"
+    }
+    for c in cols:
+        fig.add_trace(go.Scatter(
+            x=d["date_str"], y=d[c],
+            mode="markers", name=f"{c} (raw)",
+            marker=dict(size=6, color=color_hint.get(c, "#888"), opacity=0.35),
+            showlegend=False, hovertemplate=f"{c}: %{y:.3f}<extra></extra>"
+        ))
+
+    # 4) Y-Achse zoomen
+    y_min = float(d[cols].min().min())
+    y_max = float(d[cols].max().max())
+    pad = 0.02 * (y_max - y_min if y_max > y_min else 1.0)
+    lower = max(0.0, y_min - pad)
+    upper = min(1.0, y_max + pad) if y_max <= 1.0 else y_max + pad
+    fig.update_yaxes(range=[lower, upper])
+
     return fig
+
 
 
 # ---------- „Schönes Rendering“ (Plotly mit Punkt-Schatten) ----------
