@@ -287,17 +287,35 @@ st.subheader("1) Datenquelle wählen")
 mode = st.radio("Quelle", ["Datei-Upload (ZIP)", "FTP-Download", "SFTP (optional)", "Dropbox"], horizontal=True)
 selected_paths = []  # remote Pfade bei Dropbox
 
-# Datei-Upload
+# Datei-Upload: mehrere Dateien (ZIP/SIP/CSV) auf einmal
 if mode == "Datei-Upload (ZIP)":
-    up = st.file_uploader("ZIP-Datei hochladen (CSV/SIP enthalten)", type=["zip"])
-    if up is not None:
-        try:
-            with zipfile.ZipFile(io.BytesIO(up.read()),"r") as zf:
-                zf.extractall(workdir)
-            recursively_extract_archives(workdir)
-            st.success("ZIP entpackt.")
-        except Exception as e:
-            st.error(f"ZIP-Fehler: {e}")
+    uploads = st.file_uploader(
+        "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
+        type=["zip", "sip", "csv"],
+        accept_multiple_files=True
+    )
+    if uploads:
+        imported, extracted = 0, 0
+        for up in uploads:
+            fname = up.name
+            local_path = os.path.join(workdir, fname)
+            # Datei speichern
+            with open(local_path, "wb") as f:
+                f.write(up.getbuffer())
+            imported += 1
+            # ZIP/SIP sofort entpacken
+            if fname.lower().endswith((".zip", ".sip")):
+                try:
+                    with zipfile.ZipFile(local_path, "r") as zf:
+                        zf.extractall(os.path.join(workdir, os.path.splitext(fname)[0] + "_extracted"))
+                    extracted += 1
+                except zipfile.BadZipFile:
+                    st.warning(f"Beschädigtes Archiv übersprungen: {fname}")
+
+        # verschachtelte Archive auflösen
+        recursively_extract_archives(workdir)
+        st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
+
 
 # FTP
 elif mode == "FTP-Download":
@@ -319,26 +337,6 @@ elif mode == "FTP-Download":
         except Exception as e:
             st.error(f"FTP-Fehler: {e}")
 
-# SFTP
-elif mode == "SFTP (optional)":
-    if not HAS_PARAMIKO:
-        st.error("Paramiko nicht installiert.")
-    else:
-        host = st.text_input("SFTP-Host", "sftp.example.com")
-        user = st.text_input("Benutzer", "user")
-        pwd  = st.text_input("Passwort", "", type="password")
-        remote_dir = st.text_input("Remote-Pfad", "/")
-        if st.button("Vom SFTP laden"):
-            try:
-                transport = paramiko.Transport((host,22)); transport.connect(username=user, password=pwd)
-                sftp = paramiko.SFTPClient.from_transport(transport)
-                for name in [n for n in sftp.listdir(remote_dir) if n.lower().endswith(".zip")]:
-                    sftp.get(os.path.join(remote_dir,name), os.path.join(workdir,name))
-                sftp.close(); transport.close()
-                recursively_extract_archives(workdir)
-                st.success("SFTP: geladen und entpackt.")
-            except Exception as e:
-                st.error(f"SFTP-Fehler: {e}")
 
 # Dropbox
 elif mode == "Dropbox":
