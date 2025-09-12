@@ -93,10 +93,7 @@ def load_session_relatives(csv_path, agg="power"):
         return None
 
     bands = ["Delta","Theta","Alpha","Beta","Gamma"]
-    cols = {
-        b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else [])
-        for b in bands
-    }
+    cols = {b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else []) for b in bands}
     if not all(cols[b] for b in bands):
         return None
 
@@ -107,18 +104,14 @@ def load_session_relatives(csv_path, agg="power"):
             if agg == "abs":
                 val = val.abs()
             elif (val < 0).any().any():
-                val = val.pow(2)  # „power“-Aggregation bei Vorzeichenwerten
+                val = val.pow(2)  # power
             out[b.lower()] = val.mean(axis=1)  # Kanäle mitteln
         except Exception:
             return None
 
-    rel = pd.DataFrame(out).replace([np.inf, -np.inf], np.nan).dropna()
-    rel = rel.clip(lower=0)
+    rel = pd.DataFrame(out).replace([np.inf, -np.inf], np.nan).dropna().clip(lower=0)
     tot = rel.sum(axis=1).replace(0, np.nan)
     return rel.div(tot, axis=0).dropna()
-
-
-
 
 def _is_good_rel(df):
     return isinstance(df, pd.DataFrame) and not df.empty and \
@@ -170,59 +163,41 @@ def plot_stress_relax(df, smooth=5):
     fig.update_layout(xaxis=dict(type="category"))
     return fig
 
-def plot_bands(df, smooth=5):
+def plot_bands(df, smooth=5, y_mode="0–1 (fix)"):
     d = df.copy()
     d["stresswave"] = d["beta"] + d["gamma"]
     d["relaxwave"]  = d["alpha"] + d["theta"]
+    for c in ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]:
+        d[f"{c}_trend"] = d[c].rolling(window=smooth, center=True, min_periods=1).mean()
 
-    # 1) Fenster kappen
-    win = max(1, min(int(smooth), len(d)))
-
-    cols = ["delta","theta","alpha","beta","gamma","stresswave","relaxwave"]
-    for c in cols:
-        d[f"{c}_trend"] = d[c].rolling(window=win, center=True, min_periods=1).mean()
-
-    # 2) Trendlinien
     long = d.melt(
         id_vars=["date_str"],
-        value_vars=[f"{c}_trend" for c in cols],
+        value_vars=["delta_trend","theta_trend","alpha_trend","beta_trend","gamma_trend",
+                    "stresswave_trend","relaxwave_trend"],
         var_name="Band", value_name="Wert"
     )
-    label_map = {
-        "delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha",
-        "beta_trend":"Beta","gamma_trend":"Gamma",
-        "stresswave_trend":"Stress-Welle (Beta+Gamma)",
+    name_map = {
+        "delta_trend":"Delta","theta_trend":"Theta","alpha_trend":"Alpha","beta_trend":"Beta",
+        "gamma_trend":"Gamma","stresswave_trend":"Stress-Welle (Beta+Gamma)",
         "relaxwave_trend":"Entspannungs-Welle (Alpha+Theta)"
     }
-    long["Band"] = long["Band"].map(label_map)
+    long["Band"] = long["Band"].map(name_map)
 
-    import plotly.express as px, plotly.graph_objects as go
+    if y_mode == "Abweichung vom Mittelwert (%)":
+        long["Wert"] = long.groupby("Band")["Wert"].transform(lambda s: (s / (s.mean()+1e-12) - 1.0) * 100.0)
+
     fig = px.line(long, x="date_str", y="Wert", color="Band", markers=True, height=380)
     fig.update_layout(xaxis=dict(type="category"))
 
-    # 3) Rohwerte als blasse Punkte
-    color_hint = {
-        "delta":"#1f77b4","theta":"#9467bd","alpha":"#2ca02c",
-        "beta":"#ff7f0e","gamma":"#d62728","stresswave":"#17becf","relaxwave":"#bcbd22"
-    }
-    for c in cols:
-        fig.add_trace(go.Scatter(
-            x=d["date_str"], y=d[c],
-            mode="markers", name=f"{c} (raw)",
-            marker=dict(size=6, color=color_hint.get(c, "#888"), opacity=0.35),
-            showlegend=False, hovertemplate=f"{c}: %{y:.3f}<extra></extra>"
-        ))
-
-    # 4) Y-Achse zoomen
-    y_min = float(d[cols].min().min())
-    y_max = float(d[cols].max().max())
-    pad = 0.02 * (y_max - y_min if y_max > y_min else 1.0)
-    lower = max(0.0, y_min - pad)
-    upper = min(1.0, y_max + pad) if y_max <= 1.0 else y_max + pad
-    fig.update_yaxes(range=[lower, upper])
+    if y_mode == "0–1 (fix)":
+        fig.update_yaxes(range=[0,1], title="Wert")
+    elif y_mode == "Auto (zoom)":
+        fig.update_yaxes(autorange=True, title="Wert")
+    else:
+        fig.update_yaxes(title="Δ zum Mittelwert [%]")
+        fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
 
     return fig
-
 
 
 # ---------- „Schönes Rendering“ (Plotly mit Punkt-Schatten) ----------
@@ -237,7 +212,6 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
         d["stress_std"]   = d["stress"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
         d["relax_std"]    = d["relax"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
 
-        # Stress-Band + Schattenpunkte + Linie
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] + d["stress_std"], line=dict(width=0),
                                  hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] - d["stress_std"], fill='tonexty',
@@ -249,7 +223,6 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
                                  line=dict(color='rgb(220,70,70)', width=4),
                                  marker=dict(size=7, color='rgb(220,70,70)')))
 
-        # Relax-Band + Schattenpunkte + Linie
         fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] + d["relax_std"], line=dict(width=0),
                                  hoverinfo="skip", showlegend=False))
         fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] - d["relax_std"], fill='tonexty',
@@ -295,7 +268,7 @@ def make_beauty_figure(df, kind="stress_relax", smooth=5):
     raise ValueError("Unknown kind")
 
 
-# ---------- Matplotlib-Fallback-Rendering mit Punkt-Schatten ----------
+# ---------- Matplotlib-Fallback-Rendering ----------
 def render_png_matplotlib(df, kind="stress_relax", smooth=5, outpath="render.png"):
     plt.style.use("seaborn-v0_8-darkgrid")
     fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
@@ -313,24 +286,16 @@ def render_png_matplotlib(df, kind="stress_relax", smooth=5, outpath="render.png
                         alpha=0.20, color=(0.86,0.27,0.27))
         ax.fill_between(x, d["relax_trend"]-d["relax_std"], d["relax_trend"]+d["relax_std"],
                         alpha=0.20, color=(0.27,0.67,0.27))
-
         ax.scatter(x, d["stress_trend"], s=180, c="k", alpha=0.20, zorder=2)
         ax.scatter(x, d["relax_trend"],  s=180, c="k", alpha=0.20, zorder=2)
-
-        ax.plot(x, d["stress_trend"], c=(0.86,0.27,0.27), lw=3.5, zorder=3)
-        ax.scatter(x, d["stress_trend"], s=60, c=(0.86,0.27,0.27), zorder=4, label="Stress (Trend)")
-        ax.plot(x, d["relax_trend"],  c=(0.27,0.67,0.27), lw=3.5, zorder=3)
-        ax.scatter(x, d["relax_trend"],  s=60, c=(0.27,0.67,0.27), zorder=4, label="Entspannung (Trend)")
-
-        ax.set_ylabel("Index")
-        ax.set_title("Stress- und Entspannungs-Trend")
-        ax.legend(loc="best")
+        ax.plot(x, d["stress_trend"], c=(0.86,0.27,0.27), lw=3.5, zorder=3, label="Stress (Trend)")
+        ax.plot(x, d["relax_trend"],  c=(0.27,0.67,0.27), lw=3.5, zorder=3, label="Entspannung (Trend)")
+        ax.legend(loc="best"); ax.set_ylabel("Index"); ax.set_title("Stress- und Entspannungs-Trend")
 
     elif kind == "bands":
         d = df.copy()
         for c in ["delta","theta","alpha","beta","gamma"]:
             d[f"{c}_trend"] = d[c].rolling(smooth, center=True, min_periods=1).mean()
-
         series = [
             ("Delta", d["delta_trend"],  (0.39,0.58,0.93)),
             ("Theta", d["theta_trend"],  (0.28,0.24,0.55)),
@@ -342,28 +307,22 @@ def render_png_matplotlib(df, kind="stress_relax", smooth=5, outpath="render.png
             ax.scatter(x, y, s=160, c="k", alpha=0.18, zorder=2)
             ax.plot(x, y, lw=3, c=col, zorder=3, label=label)
             ax.scatter(x, y, s=48, c=col, zorder=4)
+        ax.set_ylim(0,1); ax.set_ylabel("Relativer Anteil")
+        ax.set_title("EEG-Bänder (Trendlinien)"); ax.legend(loc="best")
 
-        ax.set_ylim(0,1)
-        ax.set_ylabel("Relativer Anteil")
-        ax.set_title("EEG-Bänder (Trendlinien)")
-        ax.legend(loc="best")
-
-    ax.set_xticks(x)
-    ax.set_xticklabels(xticks, rotation=45, ha="right")
-    fig.tight_layout()
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+    ax.set_xticks(x); ax.set_xticklabels(xticks, rotation=45, ha="right")
+    fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
 
 
 # ---------- Chart-Baukasten + Cache ----------
-def build_charts(df: pd.DataFrame, smooth: int):
+def build_charts(df: pd.DataFrame, smooth: int, y_mode: str):
     charts = {}
     if len(df) == 1:
         charts["single"] = plot_single_session_interactive(df)
     else:
         charts["stress"] = plot_stress_relax(df, smooth=smooth)
-        charts["bands"]  = plot_bands(df, smooth=smooth)
+        charts["bands"]  = plot_bands(df, smooth=smooth, y_mode=y_mode)
     return charts
 
 
@@ -401,6 +360,7 @@ with st.expander("Hilfe zu Parametern", expanded=False):
 **Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.
 """)
 smooth = st.slider("Glättungsfenster (Sessions)", 3, 11, 5, 2)
+y_mode = st.selectbox("Y-Achse für Bänder", ["0–1 (fix)", "Auto (zoom)", "Abweichung vom Mittelwert (%)"], index=0)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
 
@@ -410,11 +370,12 @@ n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all)/(1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
 
-# Wenn Slider geändert → Charts neu aufbauen
+# Wenn Slider/Modus geändert → Charts neu aufbauen
 if "df_summary" in st.session_state and not st.session_state["df_summary"].empty:
-    if st.session_state.get("last_smooth") != smooth:
-        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth)
+    if st.session_state.get("last_smooth") != smooth or st.session_state.get("last_y_mode") != y_mode:
+        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, y_mode)
         st.session_state["last_smooth"] = smooth
+        st.session_state["last_y_mode"] = y_mode
 
 
 # ---------- 3) Auswertung: Daten berechnen + persistieren ----------
@@ -459,12 +420,10 @@ if st.button("Auswertung starten"):
         else:
             df = df.sort_values("datetime").reset_index(drop=True)
             df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
-
-            # Persistieren
             st.session_state["df_summary"] = df.copy()
             st.session_state["last_smooth"] = smooth
-            st.session_state["charts"] = build_charts(df, smooth)
-
+            st.session_state["last_y_mode"] = y_mode
+            st.session_state["charts"] = build_charts(df, smooth, y_mode)
             st.success(f"{len(df)} Session(s) ausgewertet. Anzeige unten aktualisiert.")
         if failed:
             st.subheader("Übersprungene Dateien")
@@ -488,7 +447,7 @@ if not df_show.empty:
         st.plotly_chart(fig1, use_container_width=True)
 
         st.subheader("Bänder + Wellen")
-        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth)
+        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth, y_mode=y_mode)
         st.plotly_chart(fig2, use_container_width=True)
 
         st.subheader("Tabelle")
@@ -502,14 +461,13 @@ if not df_show.empty:
                        file_name="summary_indices.csv", mime="text/csv")
 
 
-# ---------- 4) Export (PNG) – unabhängig, Charts bleiben stehen ----------
+# ---------- 4) Export (PNG) ----------
 st.subheader("Export")
 if df_show.empty:
     st.info("Keine Auswertung im Speicher. Erst „Auswertung starten“.")
 else:
     render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
     render_btn  = st.button("PNG rendern", key="render_btn")
-
     st.session_state.setdefault("render_path","")
 
     if render_btn:
@@ -539,6 +497,6 @@ with st.expander("Debug / Wartung", expanded=False):
     if st.button("Arbeitsordner leeren"):
         try: shutil.rmtree(st.session_state["workdir"])
         except Exception: pass
-        for k in ["workdir","df_summary","charts","render_path","last_smooth"]:
+        for k in ["workdir","df_summary","charts","render_path","last_smooth","last_y_mode"]:
             st.session_state.pop(k, None)
         st.success("Arbeitsordner geleert. Seite neu laden.")
