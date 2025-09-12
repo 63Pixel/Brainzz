@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# EEG-Auswertung – nur Datei-Upload
+# EEG-Auswertung – nur Datei-Upload mit schönem Rendering-Export
 
 import os, io, re, glob, zipfile, tempfile, shutil
 from datetime import datetime
@@ -8,18 +8,21 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import plotly.graph_objects as go
 
-# optional
+# optional (für Preprocessing)
 try:
     from scipy.signal import iirnotch, butter, filtfilt
     HAS_SCIPY = True
 except Exception:
     HAS_SCIPY = False
 
+
 # ---------- Streamlit ----------
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
-st.caption("Datei-Upload (ZIP/SIP/CSV) → Entpacken → Auswertung")
+st.caption("Datei-Upload (ZIP/SIP/CSV) → Entpacken → Auswertung → Export als PNG/SVG")
+
 
 # ---------- Persistentes Arbeitsverzeichnis ----------
 def get_workdir():
@@ -28,6 +31,7 @@ def get_workdir():
     return st.session_state["workdir"]
 
 workdir = get_workdir()
+
 
 # ---------- Helper ----------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
@@ -50,6 +54,7 @@ def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     return filtfilt(b,a,x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
+    # Nur filtern, wenn KEINE fertigen Bandspalten vorliegen
     try: df = pd.read_csv(csv_path, low_memory=False)
     except Exception: return csv_path, False
     band_prefixes = ("Delta_","Theta_","Alpha_","Beta_","Gamma_")
@@ -196,6 +201,75 @@ def build_session_table_from_list(csv_paths, tmpdir, fs=250.0, st_container=None
     return df, failed_files
 
 
+# ---------- Schönes Rendering (PNG/SVG) ----------
+def make_beauty_figure(df, kind="stress_relax", smooth=5):
+    x = df["date_str"]
+
+    if kind == "stress_relax":
+        d = df.copy()
+        d["stress_trend"] = d["stress"].rolling(smooth, center=True, min_periods=1).mean()
+        d["relax_trend"]  = d["relax"].rolling(smooth, center=True, min_periods=1).mean()
+        d["stress_std"]   = d["stress"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
+        d["relax_std"]    = d["relax"].rolling(smooth, center=True, min_periods=1).std().fillna(0)
+
+        fig = go.Figure()
+
+        # Stress-Band (Schattierung)
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] + d["stress_std"],
+                                 line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] - d["stress_std"],
+                                 fill='tonexty', fillcolor='rgba(220,70,70,0.18)',
+                                 line=dict(width=0), name="Stress Band", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"],
+                                 line=dict(color='rgb(220,70,70)', width=4),
+                                 name="Stress (Trend)", mode="lines+markers",
+                                 marker=dict(size=6)))
+
+        # Relax-Band
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] + d["relax_std"],
+                                 line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] - d["relax_std"],
+                                 fill='tonexty', fillcolor='rgba(70,170,70,0.18)',
+                                 line=dict(width=0), name="Entspannung Band", hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"],
+                                 line=dict(color='rgb(70,170,70)', width=4),
+                                 name="Entspannung (Trend)", mode="lines+markers",
+                                 marker=dict(size=6)))
+
+        fig.update_layout(height=640, margin=dict(l=40,r=20,t=60,b=60),
+                          title="Stress- und Entspannungs-Trend mit Schattierung",
+                          xaxis=dict(type="category", tickangle=45, title="Datum"),
+                          yaxis=dict(title="Index"))
+        return fig
+
+    elif kind == "bands":
+        d = df.copy()
+        for c in ["delta","theta","alpha","beta","gamma"]:
+            d[f"{c}_trend"] = d[c].rolling(smooth, center=True, min_periods=1).mean()
+
+        fig = go.Figure()
+        palette = {
+            "delta_trend":  "rgb(100,149,237)",  # cornflowerblue
+            "theta_trend":  "rgb(72,61,139)",    # darkslateblue
+            "alpha_trend":  "rgb(34,139,34)",    # forestgreen
+            "beta_trend":   "rgb(255,165,0)",    # orange
+            "gamma_trend":  "rgb(220,20,60)",    # crimson
+        }
+        for key,color in palette.items():
+            fig.add_trace(go.Scatter(
+                x=x, y=d[key], name=key.replace("_trend","").capitalize(),
+                line=dict(color=color, width=4), mode="lines"
+            ))
+        fig.update_layout(height=640, margin=dict(l=40,r=20,t=60,b=60),
+                          title="EEG-Bänder (Trendlinien)",
+                          xaxis=dict(type="category", tickangle=45, title="Datum"),
+                          yaxis=dict(title="Relativer Anteil", range=[0,1]))
+        return fig
+
+    else:
+        raise ValueError("Unknown kind")
+
+
 # ---------- 1) Datei-Upload ----------
 st.subheader("1) Datei-Upload")
 
@@ -222,22 +296,26 @@ if uploads:
     recursively_extract_archives(workdir)
     st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
 
+
 # ---------- 2) Parameter / QC ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
 **Glättungsfenster**: Sessions für Trend-Glättung (3–7).  
-**Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.
+**Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.  
+**Export**: Unten kannst du ein gerendertes PNG/SVG erzeugen.
 """)
 smooth = st.slider("Glättungsfenster (Sessions)", 3, 11, 5, 2)
 fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
+
 
 # Überblick über CSVs im Workdir
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir,"**","*.csv"), recursive=True)]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all)/(1024*1024) if n_csv>0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
+
 
 # ---------- 3) Auswertung ----------
 if st.button("Auswertung starten"):
@@ -269,6 +347,33 @@ if st.button("Auswertung starten"):
                 st.subheader("Tabelle")
                 st.dataframe(df.round(4))
 
+            # ---- Export hübsches Rendering (PNG/SVG mit Kaleido) ----
+            with st.expander("Export: Schönes Rendering als Bild", expanded=False):
+                render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"])
+                as_svg      = st.checkbox("Auch als SVG speichern", value=True)
+                if st.button("Rendering erzeugen und speichern"):
+                    kind = "stress_relax" if "Stress" in render_kind else "bands"
+                    fig  = make_beauty_figure(df, kind=kind, smooth=smooth)
+
+                    outdir = os.path.join(workdir, "exports")
+                    os.makedirs(outdir, exist_ok=True)
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
+
+                    # benötigt: requirements -> kaleido
+                    fig.write_image(png_path, width=1600, height=900, scale=3)
+                    st.success(f"Gespeichert: {png_path}")
+                    st.image(png_path, caption="Vorschau", use_column_width=True)
+                    with open(png_path, "rb") as f:
+                        st.download_button("PNG herunterladen", f, file_name=os.path.basename(png_path), mime="image/png")
+
+                    if as_svg:
+                        svg_path = os.path.join(outdir, f"render_{kind}_{ts}.svg")
+                        fig.write_image(svg_path, width=1600, height=900)
+                        with open(svg_path, "rb") as f:
+                            st.download_button("SVG herunterladen", f, file_name=os.path.basename(svg_path), mime="image/svg+xml")
+
+            # Export der numerischen Summary
             df_out = df.copy()
             df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
             st.download_button("Summary CSV herunterladen",
