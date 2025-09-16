@@ -51,17 +51,22 @@ PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path: str):
     m = PAT.search(path)
-    if not m: return None
-    try: return datetime.strptime(m.group(1), "%Y-%m-%d--%H-%M-%S")
-    except Exception: return None
+    if not m:
+        return None
+    try:
+        return datetime.strptime(m.group(1), "%Y-%m-%d--%H-%M-%S")
+    except Exception:
+        return None
 
 def notch_filter_signal(x, fs=250.0, f0=50.0, Q=30):
-    if not HAS_SCIPY: return x
+    if not HAS_SCIPY:
+        return x
     b, a = iirnotch(f0, Q, fs)
     return filtfilt(b, a, x)
 
 def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
-    if not HAS_SCIPY: return x
+    if not HAS_SCIPY:
+        return x
     nyq = fs/2.0
     b, a = butter(order, [low/nyq, high/nyq], btype="band")
     return filtfilt(b, a, x)
@@ -91,6 +96,9 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     return outp, True
 
 def load_session_relatives(csv_path, agg="power"):
+    """Lädt relative Bandanteile (Delta..Gamma) zeitaufgelöst aus einer CSV mit Kanälen Delta_*, Theta_* usw.
+       Gibt einen DataFrame mit Spalten ['delta','theta','alpha','beta','gamma'] (0..1, zeitsynchron) zurück.
+    """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -157,7 +165,7 @@ def roll_std(s, w):
     return s.rolling(window=max(1, int(w)), center=True, min_periods=1).std()
 
 
-# ---------- Interaktive Plotly-Anzeigen ----------
+# ---------- Interaktive Plotly-Anzeigen (Sessions-Übersicht) ----------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
             "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
@@ -213,6 +221,80 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
         fig.update_yaxes(title="Δ zum Mittelwert [%]")
         fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
 
+    return fig
+
+
+# ---------- Zusatz: Einzel-Session mit Zeitachse ----------
+def find_csv_by_basename(name: str, root_dir: str):
+    """Suche die Original-CSV im Arbeitsordner (rekursiv) anhand des Dateinamens."""
+    paths = [p for p in glob.glob(os.path.join(root_dir, "**", name), recursive=True)]
+    return paths[0] if paths else None
+
+def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)"):
+    """Zeitlicher Verlauf der relativen Bänder (Delta..Gamma) + Stress/Relax-Wellen über die Session."""
+    rel = load_session_relatives(csv_path)
+    if rel is None or rel.empty:
+        return go.Figure()
+
+    # Versuche Zeitachse aus CSV zu lesen; sonst aus fs approximieren
+    try:
+        df0 = pd.read_csv(csv_path, low_memory=False)
+    except Exception:
+        df0 = None
+
+    t = None
+    if df0 is not None:
+        cand = [c for c in df0.columns if str(c).lower() in
+                ["timestamp", "time", "timesec", "t", "elapsed", "seconds", "secs",
+                 "ms", "millis", "datetime", "date_time", "date", "zeit"]]
+        for c in cand:
+            s = df0[c]
+            if np.issubdtype(s.dtype, np.number):
+                val = pd.to_numeric(s, errors="coerce").values.astype(float)
+                t = val/1000.0 if ("ms" in c.lower() or "millis" in c.lower()) else val
+                break
+            else:
+                try:
+                    td = pd.to_datetime(s, errors="coerce")
+                    if td.notna().any():
+                        t = (td - td.iloc[0]).dt.total_seconds().values
+                        break
+                except Exception:
+                    pass
+    if t is None:
+        t = np.arange(len(rel)) / fs if fs and fs > 0 else np.arange(len(rel))
+
+    # Längen angleichen (DropNAs in rel können kürzen)
+    n = min(len(rel), len(t))
+    rel = rel.iloc[:n].copy()
+    t = t[:n]
+
+    # Glättung in Sekunden → Samples
+    w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
+    for c in ["delta", "theta", "alpha", "beta", "gamma"]:
+        if c in rel.columns:
+            rel[c] = roll_mean(rel[c], w)
+    rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
+    rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
+
+    long = rel.copy()
+    long["t"] = t
+    long = long.melt(id_vars=["t"],
+                     value_vars=["delta","theta","alpha","beta","gamma","stresswave","relaxwave"],
+                     var_name="Band", value_name="Wert")
+    name_map = {
+        "delta": "Delta", "theta": "Theta", "alpha": "Alpha", "beta": "Beta", "gamma": "Gamma",
+        "stresswave": "Stress-Welle (Beta+Gamma)",
+        "relaxwave": "Entspannungs-Welle (Alpha+Theta)"
+    }
+    long["Band"] = long["Band"].map(name_map)
+
+    fig = px.line(long, x="t", y="Wert", color="Band", height=380)
+    fig.update_layout(xaxis_title="Zeit [s]")
+    if y_mode == "0–1 (fix)":
+        fig.update_yaxes(range=[0, 1], title="Relativer Anteil")
+    else:
+        fig.update_yaxes(title="Relativer Anteil")
     return fig
 
 
@@ -350,173 +432,4 @@ uploads = st.file_uploader(
 )
 if uploads:
     imported, extracted = 0, 0
-    for up in uploads:
-        fname = up.name
-        local_path = os.path.join(workdir, fname)
-        with open(local_path, "wb") as f:
-            f.write(up.getbuffer())
-        imported += 1
-        if fname.lower().endswith((".zip", ".sip")):
-            try:
-                with zipfile.ZipFile(local_path, "r") as zf:
-                    zf.extractall(os.path.join(workdir, os.path.splitext(fname)[0] + "_extracted"))
-                extracted += 1
-            except zipfile.BadZipFile:
-                st.warning(f"Beschädigtes Archiv übersprungen: {fname}")
-    recursively_extract_archives(workdir)
-    st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
-
-
-# ---------- 2) Parameter / QC ----------
-st.subheader("2) Parameter / QC")
-with st.expander("Hilfe zu Parametern", expanded=False):
-    st.markdown("""
-**Glättungsfenster**: 1 = keine Glättung; höhere Werte glätten stärker.  
-**Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.
-""")
-smooth = st.slider("Glättungsfenster (Sessions)", 1, 15, 2, 1,
-                   help="1 = keine Glättung; höhere Werte glätten stärker")
-y_mode = st.selectbox("Y-Achse für Bänder", ["0–1 (fix)", "Auto (zoom)", "Abweichung vom Mittelwert (%)"], index=0)
-fs = st.number_input("Sampling-Rate für Preprocessing (Hz)", value=250.0, step=1.0)
-do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
-
-# CSV-Überblick
-csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
-n_csv = len(csv_paths_all)
-total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv > 0 else 0.0
-st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
-
-# Charts bei Parameterwechsel neu bauen
-if "df_summary" in st.session_state and not st.session_state["df_summary"].empty:
-    if st.session_state.get("last_smooth") != smooth or st.session_state.get("last_y_mode") != y_mode:
-        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, y_mode)
-        st.session_state["last_smooth"] = smooth
-        st.session_state["last_y_mode"]  = y_mode
-
-
-# ---------- 3) Auswertung ----------
-if st.button("Auswertung starten"):
-    recursively_extract_archives(workdir)
-    selected_csvs = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
-    if not selected_csvs:
-        st.error("Keine CSVs gefunden.")
-    else:
-        tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
-        rows, failed = [], []
-        for cp in sorted(selected_csvs):
-            try:
-                _ = pd.read_csv(cp, nrows=1)
-            except Exception:
-                failed.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
-                continue
-            dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
-            if dt is None:
-                failed.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel."})
-                continue
-            proc_path, _ = preprocess_csv_if_raw(cp, tmpdir, fs=(fs if do_preproc else 0.0))
-            rel = load_session_relatives(proc_path)
-            if not _is_good_rel(rel):
-                rel = load_session_relatives(cp)
-            if not _is_good_rel(rel):
-                failed.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten."})
-                continue
-            alpha, beta  = float(rel["alpha"].mean()), float(rel["beta"].mean())
-            theta, delta = float(rel["theta"].mean()), float(rel["delta"].mean())
-            gamma        = float(rel["gamma"].mean())
-            rows.append({
-                "datetime": dt, "alpha": alpha, "beta": beta, "theta": theta, "delta": delta, "gamma": gamma,
-                "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
-            })
-        try:
-            shutil.rmtree(tmpdir)
-        except Exception:
-            pass
-
-        df = pd.DataFrame(rows)
-        if df.empty:
-            st.error("Keine gültigen Sessions.")
-        else:
-            df = df.sort_values("datetime").reset_index(drop=True)
-            df["date_str"] = df["datetime"].dt.strftime("%d-%m-%y %H:%M")
-            st.session_state["df_summary"] = df.copy()
-            st.session_state["last_smooth"] = smooth
-            st.session_state["last_y_mode"]  = y_mode
-            st.session_state["charts"] = build_charts(df, smooth, y_mode)
-            st.success(f"{len(df)} Session(s) ausgewertet. Anzeige unten aktualisiert.")
-        if failed:
-            st.subheader("Übersprungene Dateien")
-            for f in failed:
-                st.warning(f"{f['source']}: {f['reason']}")
-
-
-# ---------- 3b) Anzeige aus Session-State ----------
-df_show = st.session_state.get("df_summary", pd.DataFrame())
-charts  = st.session_state.get("charts", {})
-
-if not df_show.empty:
-    if len(df_show) == 1:
-        st.subheader("Einzel-Session")
-        fig = charts.get("single") or plot_single_session_interactive(df_show)
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df_show.round(4))
-    else:
-        st.subheader("Stress/Entspannung")
-        fig1 = charts.get("stress") or plot_stress_relax(df_show, smooth=smooth)
-        st.plotly_chart(fig1, use_container_width=True)
-
-        st.subheader("Bänder + Wellen")
-        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth, y_mode=y_mode)
-        st.plotly_chart(fig2, use_container_width=True)
-
-        st.subheader("Tabelle")
-        st.dataframe(df_show.round(4))
-
-    # Download Summary
-    df_out = df_show.copy()
-    df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
-    st.download_button("Summary CSV herunterladen",
-                       data=df_out.to_csv(index=False).encode("utf-8"),
-                       file_name="summary_indices.csv", mime="text/csv")
-
-
-# ---------- 4) Export (PNG) ----------
-st.subheader("Export")
-if df_show.empty:
-    st.info("Keine Auswertung im Speicher. Erst „Auswertung starten“.")
-else:
-    render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
-    render_btn  = st.button("PNG rendern", key="render_btn")
-    st.session_state.setdefault("render_path", "")
-
-    if render_btn:
-        kind = "stress_relax" if "Stress" in render_kind else "bands"
-        outdir = os.path.join(workdir, "exports"); os.makedirs(outdir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
-        try:
-            if not HAS_KALEIDO:
-                raise RuntimeError("Kaleido nicht installiert")
-            fig = make_beauty_figure(df_show, kind=kind, smooth=smooth)
-            pio.write_image(fig, png_path, width=1600, height=900, scale=3, engine="kaleido")
-        except Exception:
-            png_path = render_png_matplotlib(df_show, kind=kind, smooth=smooth, outpath=png_path)
-        st.session_state["render_path"] = png_path
-        st.success(f"PNG erzeugt: {png_path}")
-
-    if st.session_state.get("render_path") and os.path.isfile(st.session_state["render_path"]):
-        p = st.session_state["render_path"]
-        st.image(p, caption="Rendering-Vorschau (PNG)", use_container_width=True)
-        with open(p, "rb") as f:
-            st.download_button("PNG herunterladen", f, file_name=os.path.basename(p), mime="image/png")
-
-
-# ---------- Wartung ----------
-with st.expander("Debug / Wartung", expanded=False):
-    if st.button("Arbeitsordner leeren"):
-        try:
-            shutil.rmtree(st.session_state["workdir"])
-        except Exception:
-            pass
-        for k in ["workdir", "df_summary", "charts", "render_path", "last_smooth", "last_y_mode"]:
-            st.session_state.pop(k, None)
-        st.success("Arbeisordner geleert. Seite neu laden.")
+    f
