@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # EEG-Auswertung – Upload, Auswertung, persistent Charts, JPG-Rendering (Matplotlib fallback)
-# Optimized + caching + user presets for downsampling + fancy/plain exports
+# Korrigierte Version: Namenskonflikte beseitigt, temporäre Variablen sprechend, minor optimizations.
 
 import os
 import re
@@ -26,7 +26,7 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# Kaleido explicitly off (you preferred Matplotlib fallback)
+# Kaleido explicitly off (we use Matplotlib fallback)
 HAS_KALEIDO = False
 
 # Pillow for PNG->JPG conversion
@@ -60,7 +60,6 @@ workdir = get_workdir()
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path: str):
-    """Extrahiere Datum/Uhrzeit im Pattern brainzz_YYYY-MM-DD--HH-MM-SS aus Pfad/Name."""
     if not path:
         return None
     m = PAT.search(path)
@@ -133,15 +132,17 @@ def find_csv_by_basename(name: str, root_dir: str):
     paths = [p for p in glob.glob(os.path.join(root_dir, "**", name), recursive=True)]
     return paths[0] if paths else None
 
+# --------- Validity check for relative-band DataFrame (renamed for clarity) ----------
+def is_good_rel(df):
+    return isinstance(df, pd.DataFrame) and not df.empty and all(c in df.columns for c in ["alpha", "beta", "theta", "delta", "gamma"])
+
 # ---------- Caching: Lade/Verarbeite Sessions (performance) ----------
-# st.cache_data verwendet Dateipfad + mtime als Key (so wird neu geladen, wenn Datei sich ändert)
 @st.cache_data(show_spinner=False)
 def _read_csv_head(path: str, nrows: int = 1):
     return pd.read_csv(path, nrows=nrows, low_memory=False)
 
 @st.cache_data(show_spinner=False)
 def load_session_relatives_cached(csv_path: str, mtime: float, agg: str = "power"):
-    """Cache-basiertes Laden der relativen Bandanteile; key = (csv_path, mtime)."""
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -166,11 +167,10 @@ def load_session_relatives_cached(csv_path: str, mtime: float, agg: str = "power
     return rel.div(tot, axis=0).dropna()
 
 def load_session_relatives(csv_path, agg="power"):
-    """Wrapper: benutzt cached version und mtime zum Cache-Busting."""
     mtime = get_mtime(csv_path) or 0.0
     return load_session_relatives_cached(csv_path, mtime, agg=agg)
 
-# ---------- Decimate (Anzeige & Export) ----------
+# ---------- Decimate ----------
 def decimate_series(y, max_points=800):
     if y is None:
         return None
@@ -192,7 +192,7 @@ def decimate_xy(x, y, max_points=800):
     y_arr = np.asarray(y)
     return x_arr.take(idx), y_arr.take(idx)
 
-# ---------- Plot-Funktionen (interaktiv, downsampled für Performance) ----------
+# ---------- Plot-Funktionen ----------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
             "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
@@ -283,7 +283,6 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
         return go.Figure()
-    # try read time column once (cached through _read_csv_head if small)
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -350,10 +349,8 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
             continue
         y = rel[key].values
         x_dec, y_dec = decimate_xy(x_vals.values, y, max_points=max_points)
-        # shadow
         fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", showlegend=False, hoverinfo="skip",
                                  line=dict(color="rgba(0,0,0,0.06)", width=8)))
-        # main line
         fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", name=label,
                                  line=dict(color=palette.get(label, "gray"), width=2)))
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=40))
@@ -467,8 +464,9 @@ def render_single_session_timeline_matplotlib(csv_path: str, fs=250.0, smooth_se
             y_arr = np.asarray(y)
             y_dec = decimate_series(y_arr, max_points=MAX_POINTS)
             ax.plot(np.linspace(0, len(y_dec)-1, num=len(y_dec)), y_dec, lw=1.8, label=name, color=colors.get(name,(0.2,0.2,0.2)))
-    ax.set_xticks(np.linspace(0, len(dec_x)-1, num=len(tick_positions), dtype=int))
-    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
+    if len(tick_labels) > 0:
+        ax.set_xticks(np.linspace(0, len(dec_x)-1, num=len(tick_positions), dtype=int))
+        ax.set_xticklabels(tick_labels, rotation=45, ha="right")
     if y_mode == "0–1 (fix)":
         ax.set_ylim(0,1)
     ax.set_ylabel("Relativer Anteil")
@@ -564,7 +562,7 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
 
-# ---------- JPG helpers ----------
+# ---------- JPG/helpers ----------
 def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color=(255,255,255)):
     if not HAS_PIL:
         raise RuntimeError("Pillow nicht installiert")
@@ -580,7 +578,6 @@ def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color
 
 def save_matplotlib_then_jpg(make_png_func, out_base: str, jpg_quality=80, **kwargs):
     out_png = f"{out_base}.png"
-    # call renderer; ensure outpath kw is passed
     kwargs = dict(kwargs)
     kwargs["outpath"] = out_png
     make_png_func(**kwargs)
@@ -626,7 +623,7 @@ def build_charts(df: pd.DataFrame, smooth: int, y_mode: str, max_points: int = 8
         charts["bands"]  = plot_bands(df, smooth=smooth, y_mode=y_mode, max_points=max_points)
     return charts
 
-# ---------- UI: Upload + immediate presets + green button ----------
+# ---------- UI: Upload + presets + inline Auswertung ----------
 st.subheader("1) Datei-Upload")
 uploads = st.file_uploader(
     "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
@@ -634,7 +631,6 @@ uploads = st.file_uploader(
     accept_multiple_files=True
 )
 
-# simple placeholders for display_max default; will be set after upload
 DEFAULT_DISPLAY_MAX = 800
 
 if uploads:
@@ -655,7 +651,6 @@ if uploads:
     recursively_extract_archives(workdir)
     st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
 
-    # --- Presets + override for displayed points (user-requested) ---
     st.markdown("**Anzeige-Dichte (für interaktive Plots)**")
     preset = st.selectbox("Voreinstellung", ["sehr niedrig", "niedrig", "mittel (800)", "hoch", "sehr hoch", "maximum"], index=2,
                           help="Wähle eine Voreinstellung; du kannst unten einen genauen Wert überschreiben.")
@@ -670,10 +665,8 @@ if uploads:
     preset_value = preset_map.get(preset, DEFAULT_DISPLAY_MAX)
     custom_val = st.number_input("Maximal anzuzeigende Punkte (Override)", min_value=50, max_value=20000, value=int(preset_value), step=50)
     display_max = int(custom_val) if custom_val is not None else int(preset_value)
-    # Save display_max so other parts can use it
     st.session_state["display_max"] = display_max
 
-    # small CSS to highlight the primary button (affects first visible button)
     st.markdown("""
     <style>
     div.stButton > button:first-child {
@@ -684,9 +677,7 @@ if uploads:
     </style>
     """, unsafe_allow_html=True)
 
-    # Inline Auswertung-Button (grün)
     if st.button("Auswertung starten", key="start_eval"):
-        # run the exact same logic as previous evaluation block but using display_max
         recursively_extract_archives(workdir)
         selected_csvs = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
         if not selected_csvs:
@@ -695,8 +686,9 @@ if uploads:
             tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
             rows, failed = [], []
             for cp in sorted(selected_csvs):
+                # quick sanity read
                 try:
-                    _ = pd.read_csv(cp, nrows=1)
+                    pd.read_csv(cp, nrows=1)
                 except Exception:
                     failed.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
                     continue
@@ -704,20 +696,22 @@ if uploads:
                 if dt is None:
                     failed.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel."})
                     continue
-                proc_path, _ = (cp, False)
-                # try preprocess if desired and available
-                if HAS_SCIPY:
+                # preprocess attempt with descriptive flag
+                proc_path = cp
+                did_preproc = False
+                if HAS_SCIPY and st.session_state.get("fs", 250.0) > 0:
                     try:
-                        # call preprocess but avoid caching heavy operations; keep simple fallback
-                        proc_path, _ = preprocess_csv_if_raw(cp, tmpdir, fs=(st.session_state.get("fs", 250.0)))
+                        proc_path_candidate, preproc_done = preprocess_csv_if_raw(cp, tmpdir, fs=st.session_state.get("fs", 250.0))
+                        if preproc_done and proc_path_candidate:
+                            proc_path = proc_path_candidate
+                            did_preproc = True
                     except Exception:
                         proc_path = cp
-                else:
-                    proc_path = cp
+                        did_preproc = False
                 rel = load_session_relatives(proc_path)
-                if not _is_good_rel(rel):
+                if not is_good_rel(rel):
                     rel = load_session_relatives(cp)
-                if not _is_good_rel(rel):
+                if not is_good_rel(rel):
                     failed.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten."})
                     continue
                 alpha, beta  = float(rel["alpha"].mean()), float(rel["beta"].mean())
@@ -751,7 +745,7 @@ if uploads:
 if "display_max" not in st.session_state:
     st.session_state["display_max"] = DEFAULT_DISPLAY_MAX
 
-# ---------- Existing parameter area (kept for continuity) ----------
+# ---------- Parameter / QC ----------
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
@@ -762,8 +756,6 @@ smooth = st.slider("Glättungsfenster (Sessions)", 1, 15, 2, 1)
 y_mode = st.selectbox("Y-Achse für Bänder", ["0–1 (fix)", "Auto (zoom)", "Abweichung vom Mittelwert (%)"], index=0)
 fs = st.number_input("Sampling-Rate für Preprocessing/Timeline (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
-
-# ensure session_state values updated
 st.session_state["fs"] = fs
 st.session_state["last_smooth"] = smooth
 st.session_state["last_y_mode"] = y_mode
@@ -773,10 +765,12 @@ n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv > 0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
 
-# Rebuild charts when params changed
+# rebuild charts when params changed
 if "df_summary" in st.session_state and not st.session_state["df_summary"].empty:
-    if st.session_state.get("last_smooth") != smooth or st.session_state.get("last_y_mode") != y_mode or st.session_state.get("display_max") != st.session_state.get("display_max"):
+    if st.session_state.get("last_smooth") != smooth or st.session_state.get("last_y_mode") != y_mode:
         st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, y_mode, max_points=st.session_state.get("display_max", DEFAULT_DISPLAY_MAX))
+        st.session_state["last_smooth"] = smooth
+        st.session_state["last_y_mode"]  = y_mode
 
 # ---------- Anzeige (Timeline zuerst, dann Balken) ----------
 df_show = st.session_state.get("df_summary", pd.DataFrame())
@@ -785,7 +779,6 @@ charts  = st.session_state.get("charts", {})
 if not df_show.empty:
     if len(df_show) == 1:
         st.subheader("Einzel-Session")
-        # Timeline first
         st.markdown("### Zeitverlauf (Einzel-Session)")
         ss_smooth = st.slider("Glättung (Sekunden)", 0, 30, 3, 1)
         y_mode_single = st.selectbox("Y-Achse (Einzel-Session)", ["0–1 (fix)", "Auto (zoom)"], index=0)
@@ -796,7 +789,6 @@ if not df_show.empty:
             st.plotly_chart(fig_ts, use_container_width=True)
         else:
             st.info("Original-CSV für die Einzel-Session wurde nicht gefunden.")
-        # then bar below
         st.markdown("### Balkendiagramm (Einzel-Session)")
         fig_bar = charts.get("single") or plot_single_session_interactive(df_show)
         st.plotly_chart(fig_bar, use_container_width=True)
@@ -827,7 +819,6 @@ else:
         export_btn = st.button("JPG rendern (Einzel-Session)")
         session_csv_name = df_show.iloc[0]["source"]
         session_csv_path = find_csv_by_basename(session_csv_name, workdir)
-        # use session filename derived from path dt if possible
         dt = parse_dt_from_path(session_csv_path) or parse_dt_from_path(session_csv_name)
         session_base = format_session_filename(dt) if dt else os.path.splitext(session_csv_name)[0]
         outdir = os.path.join(workdir, "exports"); os.makedirs(outdir, exist_ok=True)
