@@ -36,7 +36,7 @@ except Exception:
 # optional: Plotly→Kaleido
 try:
     import kaleido  # noqa: F401
-    HAS_KALEIDO = True
+    HAS_KALEIDO = False
 except Exception:
     HAS_KALEIDO = False
 
@@ -206,11 +206,13 @@ def plot_stress_relax(df, smooth=1):
     d = df.copy()
     d["stress_trend"] = roll_mean(d["stress"], smooth)
     d["relax_trend"]  = roll_mean(d["relax"],  smooth)
-    long = d.melt(id_vars=["date_str"], value_vars=["stress", "relax", "stress_trend", "relax_trend"],
+    long = d.melt(id_vars=["date_str"], value_vars=["stress_trend", "relax_trend"],
                   var_name="Metrik", value_name="Wert")
-    fig = px.line(long, x="date_str", y="Wert", color="Metrik", markers=True, height=360)
-    fig.update_layout(xaxis=dict(type="category"))
+    # plotly express ohne marker
+    fig = px.line(long, x="date_str", y="Wert", color="Metrik", markers=False, height=360)
+    fig.update_layout(xaxis=dict(type="category"), showlegend=True)
     return fig
+
 
 def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
     d = df.copy()
@@ -288,7 +290,7 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
     if rel is None or rel.empty:
         return go.Figure()
 
-    # CSV laden (versuchen Zeitstempel zu finden)
+    # CSV laden (versuche datetime-Spalte)
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -298,14 +300,13 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
     is_datetime = False
     if df0 is not None:
         cand = [c for c in df0.columns if str(c).lower() in
-                ["timestamp", "time", "timesec", "t", "elapsed", "seconds", "secs",
-                 "ms", "millis", "datetime", "date_time", "date", "zeit", "clock", "uhrzeit"]]
+                ["timestamp","time","timesec","t","elapsed","seconds","secs",
+                 "ms","millis","datetime","date_time","date","zeit","clock","uhrzeit"]]
         for c in cand:
             s = df0[c]
             if np.issubdtype(s.dtype, np.number):
                 val = pd.to_numeric(s, errors="coerce").astype(float)
                 if np.nanmax(val) > 1e6:
-                    # treat as ms epoch or ms elapsed -> to datetime
                     try:
                         x_vals = pd.to_datetime(val, unit="ms")
                         is_datetime = True
@@ -329,58 +330,43 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
                 except Exception:
                     pass
 
-    # fallback: use relative seconds converted to datetime origin for prettier labels
+    # fallback: relative seconds as datetimes for prettier labels
     if x_vals is None:
         secs = np.arange(len(rel)) / (fs if fs and fs > 0 else 1.0)
         x_vals = pd.to_datetime(secs, unit="s", origin=pd.Timestamp("1970-01-01"))
         is_datetime = True
 
-    # angleichen
     n = min(len(rel), len(x_vals))
     rel = rel.iloc[:n].copy()
     x_vals = pd.Series(x_vals).iloc[:n].reset_index(drop=True)
 
-    # glätten
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
-    for c in ["delta", "theta", "alpha", "beta", "gamma"]:
+    for c in ["delta","theta","alpha","beta","gamma"]:
         if c in rel.columns:
             rel[c] = roll_mean(rel[c], w)
     rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
 
-    # prepare per-band traces with sparse markers
     bands_map = {
-        "delta": "Delta", "theta": "Theta", "alpha": "Alpha",
-        "beta": "Beta", "gamma": "Gamma",
-        "stresswave": "Stress-Welle (Beta+Gamma)",
-        "relaxwave": "Entspannungs-Welle (Alpha+Theta)"
+        "delta":"Delta","theta":"Theta","alpha":"Alpha",
+        "beta":"Beta","gamma":"Gamma",
+        "stresswave":"Stress-Welle (Beta+Gamma)","relaxwave":"Entspannungs-Welle (Alpha+Theta)"
     }
 
     fig = go.Figure()
-    total_points = len(rel)
-    marker_step = max(1, int(total_points / 80))  # ~80 marker points per series
-
+    # For performance: only two traces per series (shadow + main line)
     for key, label in bands_map.items():
         if key not in rel.columns:
             continue
         y = rel[key].values
-        # faint shadow behind line first (for depth)
+        # shadow (broad faint line)
         fig.add_trace(go.Scatter(
-            x=x_vals, y=y, mode="lines",
-            showlegend=False, hoverinfo="skip",
+            x=x_vals, y=y, mode="lines", showlegend=False, hoverinfo="skip",
             line=dict(color="rgba(0,0,0,0.06)", width=8)
         ))
         # main line
         fig.add_trace(go.Scatter(
-            x=x_vals, y=y, mode="lines",
-            name=label, line=dict(width=2)
-        ))
-        # sparse markers
-        idx = np.arange(0, total_points, marker_step)
-        fig.add_trace(go.Scatter(
-            x=x_vals.iloc[idx], y=y[idx],
-            mode="markers", showlegend=False, hoverinfo="skip",
-            marker=dict(size=6, opacity=0.22)
+            x=x_vals, y=y, mode="lines", name=label, line=dict(width=2)
         ))
 
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=40))
@@ -389,7 +375,7 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
     else:
         fig.update_xaxes(title_text="Zeit [s]", tickangle=45)
     if y_mode == "0–1 (fix)":
-        fig.update_yaxes(range=[0, 1], title="Relativer Anteil")
+        fig.update_yaxes(range=[0,1], title="Relativer Anteil")
     else:
         fig.update_yaxes(title="Relativer Anteil")
     return fig
@@ -641,8 +627,7 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
     ]
     for name, y in series:
         if y is not None:
-            ax2.plot(t, y, lw=2.0, label=name)
-            ax2.scatter(t, y, s=36, alpha=0.6)
+            ax2.plot(t, y, lw=2.0, label=name)   # nur Linie, kein scatter
     ax2.set_xlabel("Uhrzeit")
     ax2.set_xticks(t)
     ax2.set_xticklabels(time_labels[:n], rotation=45)
@@ -654,6 +639,7 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
 
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
+
 
 
 # ---------- PNG->JPG Konvertierung (Pillow) ----------
