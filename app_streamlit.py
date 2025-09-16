@@ -434,6 +434,11 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
 
 # ---------- „Schönes Rendering“ (Plotly hübsch) ----------
 def make_beauty_figure(df, kind="stress_relax", smooth=1):
+    """
+    Erzeugt eine hübsche Plotly-Figur:
+    - kind == "stress_relax": Stress- und Entspannungs-Trend mit Bändern
+    - kind == "bands": Trendlinien für die Bänder
+    """
     x = df["date_str"]
     fig = go.Figure()
 
@@ -444,59 +449,149 @@ def make_beauty_figure(df, kind="stress_relax", smooth=1):
         d["stress_std"]   = roll_std(d["stress"], smooth).fillna(0)
         d["relax_std"]    = roll_std(d["relax"],  smooth).fillna(0)
 
-        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] + d["stress_std"], line=dict(width=0),
-                                 hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"] - d["stress_std"], fill='tonexty',
-                                 fillcolor='rgba(220,70,70,0.18)', line=dict(width=0),
-                                 name="Stress Band", hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], mode="markers", hoverinfo="skip", showlegend=False,
-                                 marker=dict(size=14, color="rgba(0,0,0,0.20)"))
-        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], name="Stress (Trend)", mode="lines+markers",
-                                 line=dict(color='rgb(220,70,70)', width=4),
-                                 marker=dict(size=7, color='rgb(220,70,70)')))
+        # Stress band (Fläche)
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["stress_trend"] + d["stress_std"],
+                line=dict(width=0),
+                hoverinfo="skip",
+                showlegend=False
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["stress_trend"] - d["stress_std"],
+                fill="tonexty",
+                fillcolor="rgba(220,70,70,0.18)",
+                line=dict(width=0),
+                name="Stress Band",
+                hoverinfo="skip"
+            )
+        )
 
-        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] + d["relax_std"], line=dict(width=0),
-                                 hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"] - d["relax_std"], fill='tonexty',
-                                 fillcolor='rgba(70,170,70,0.18)', line=dict(width=0),
-                                 name="Entspannung Band", hoverinfo="skip"))
-        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"], mode="markers", hoverinfo="skip", showlegend=False,
-                                 marker=dict(size=14, color="rgba(0,0,0,0.20)")))
-        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"], name="Entspannung (Trend)", mode="lines+markers",
-                                 line=dict(color='rgb(70,170,70)', width=4),
-                                 marker=dict(size=7, color='rgb(70,170,70)')))
+        # Stress markers + line
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["stress_trend"],
+                mode="markers",
+                hoverinfo="skip",
+                showlegend=False,
+                marker=dict(size=14, color="rgba(0,0,0,0.20)")
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["stress_trend"],
+                name="Stress (Trend)",
+                mode="lines+markers",
+                line=dict(color="rgb(220,70,70)", width=4),
+                marker=dict(size=7, color="rgb(220,70,70)")
+            )
+        )
 
-        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
-                          title="Stress- und Entspannungs-Trend",
-                          xaxis=dict(type="category", tickangle=45, title="Datum"),
-                          yaxis=dict(title="Index"))
+        # Relax band (Fläche)
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["relax_trend"] + d["relax_std"],
+                line=dict(width=0),
+                hoverinfo="skip",
+                showlegend=False
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["relax_trend"] - d["relax_std"],
+                fill="tonexty",
+                fillcolor="rgba(70,170,70,0.18)",
+                line=dict(width=0),
+                name="Entspannung Band",
+                hoverinfo="skip"
+            )
+        )
+
+        # Relax markers + line
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["relax_trend"],
+                mode="markers",
+                hoverinfo="skip",
+                showlegend=False,
+                marker=dict(size=14, color="rgba(0,0,0,0.20)")
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=d["relax_trend"],
+                name="Entspannung (Trend)",
+                mode="lines+markers",
+                line=dict(color="rgb(70,170,70)", width=4),
+                marker=dict(size=7, color="rgb(70,170,70)")
+            )
+        )
+
+        fig.update_layout(
+            height=640,
+            margin=dict(l=40, r=20, t=60, b=60),
+            title="Stress- und Entspannungs-Trend",
+            xaxis=dict(type="category", tickangle=45, title="Datum"),
+            yaxis=dict(title="Index")
+        )
         return fig
 
     if kind == "bands":
         d = df.copy()
         for c in ["delta", "theta", "alpha", "beta", "gamma"]:
             d[f"{c}_trend"] = roll_mean(d[c], smooth)
+
         palette = {
             "delta_trend": ("Delta", "rgb(100,149,237)"),
             "theta_trend": ("Theta", "rgb(72,61,139)"),
             "alpha_trend": ("Alpha", "rgb(34,139,34)"),
             "beta_trend":  ("Beta",  "rgb(255,165,0)"),
-            "gamma_trend": ("Gamma", "rgb(220,20,60)"),
+            "gamma_trend": ("Gamma", "rgb(220,20,60)")
         }
-        for key, (label, color) in palette.items():
-            fig.add_trace(go.Scatter(x=x, y=d[key], mode="markers", hoverinfo="skip", showlegend=False,
-                                     marker=dict(size=12, color="rgba(0,0,0,0.18)")))
-            fig.add_trace(go.Scatter(x=x, y=d[key], name=label, mode="lines+markers",
-                                     line=dict(color=color, width=3.5),
-                                     marker=dict(size=6, color=color)))
 
-        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
-                          title="EEG-Bänder (Trendlinien)",
-                          xaxis=dict(type="category", tickangle=45, title="Datum"),
-                          yaxis=dict(title="Relativer Anteil", range=[0, 1]))
+        for key, (label, color) in palette.items():
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=d[key],
+                    mode="markers",
+                    hoverinfo="skip",
+                    showlegend=False,
+                    marker=dict(size=12, color="rgba(0,0,0,0.18)")
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=x,
+                    y=d[key],
+                    name=label,
+                    mode="lines+markers",
+                    line=dict(color=color, width=3.5),
+                    marker=dict(size=6, color=color)
+                )
+            )
+
+        fig.update_layout(
+            height=640,
+            margin=dict(l=40, r=20, t=60, b=60),
+            title="EEG-Bänder (Trendlinien)",
+            xaxis=dict(type="category", tickangle=45, title="Datum"),
+            yaxis=dict(title="Relativer Anteil", range=[0, 1])
+        )
         return fig
 
     raise ValueError("Unknown kind")
+
 
 
 # ---------- Matplotlib-Fallback (Multi-Session) ----------
