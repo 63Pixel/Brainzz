@@ -311,17 +311,29 @@ def compose_single_session_plotly(df_single: pd.DataFrame, csv_path: str,
                                   fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)"):
     """Plotly-Subplot (oben Balken, unten Zeitverlauf) für EINZEL-Session."""
     from copy import deepcopy
+
+    # 1) Balken (oben)
     fig_bar = plot_single_session_interactive(df_single)
+
+    # 2) Zeitverlauf (unten)
     fig_time = plot_single_session_timeline(csv_path, fs=fs, smooth_seconds=smooth_seconds, y_mode=y_mode)
 
-    fig = make_subplots(rows=2, cols=1, shared_x=False,
-                        row_heights=[0.35, 0.65], vertical_spacing=0.08,
-                        subplot_titles=("Balkendiagramm", "Zeitverlauf"))
+    # 3) Kombi-Figur (use correct keyword: shared_xaxes)
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=False,
+        row_heights=[0.35, 0.65],
+        vertical_spacing=0.08,
+        subplot_titles=("Balkendiagramm", "Zeitverlauf")
+    )
+
+    # copy traces (deepcopy to avoid mutated refs)
     for tr in fig_bar.data:
         fig.add_trace(deepcopy(tr), row=1, col=1)
     for tr in fig_time.data:
         fig.add_trace(deepcopy(tr), row=2, col=1)
 
+    # Achsen & Layout
     fig.update_xaxes(title_text=None, row=1, col=1)
     fig.update_yaxes(title_text="Wert", row=1, col=1)
     fig.update_xaxes(title_text="Zeit [s]", row=2, col=1)
@@ -329,8 +341,10 @@ def compose_single_session_plotly(df_single: pd.DataFrame, csv_path: str,
         fig.update_yaxes(range=[0, 1], title_text="Relativer Anteil", row=2, col=1)
     else:
         fig.update_yaxes(title_text="Relativer Anteil", row=2, col=1)
+
     fig.update_layout(height=1000, margin=dict(l=40, r=20, t=60, b=60))
     return fig
+
 
 def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Series,
                                                       fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)",
