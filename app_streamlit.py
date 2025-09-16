@@ -23,7 +23,7 @@ except Exception:
 # optional: Plotly→Kaleido
 try:
     import kaleido  # noqa: F401
-    HAS_KALEIDO = True
+    HAS_KALEIDO = False
 except Exception:
     HAS_KALEIDO = False
 
