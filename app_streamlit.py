@@ -450,7 +450,7 @@ def make_beauty_figure(df, kind="stress_relax", smooth=1):
                                  fillcolor='rgba(220,70,70,0.18)', line=dict(width=0),
                                  name="Stress Band", hoverinfo="skip"))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], mode="markers", hoverinfo="skip", showlegend=False,
-                                 marker=dict	size=14, color="rgba(0,0,0,0.20)")),
+                                 marker=dict(size=14, color="rgba(0,0,0,0.20)"))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], name="Stress (Trend)", mode="lines+markers",
                                  line=dict(color='rgb(220,70,70)', width=4),
                                  marker=dict(size=7, color='rgb(220,70,70)')))
