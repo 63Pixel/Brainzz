@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# EEG-Auswertung – Upload, Auswertung, persistente Charts, PNG-Rendering (Plotly→Kaleido, Fallback Matplotlib)
+# EEG-Auswertung – Upload, Auswertung, persistente Charts, PNG-/JPG-Export
 
 import os, re, glob, zipfile, tempfile, shutil
 from datetime import datetime
@@ -10,6 +10,8 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.subplots import make_subplots
+import warnings
 
 # optional: Preprocessing
 try:
@@ -18,12 +20,19 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# optional: Plotly→Kaleido PNG
+# optional: Plotly→Kaleido
 try:
     import kaleido  # noqa: F401
     HAS_KALEIDO = True
 except Exception:
     HAS_KALEIDO = False
+
+# optional: PNG→JPG
+try:
+    from PIL import Image
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
 
 # Matplotlib-Fallback (kein Chrome nötig)
 import matplotlib
@@ -34,7 +43,7 @@ import matplotlib.pyplot as plt
 # ---------- Streamlit ----------
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
-st.caption("Datei-Upload (ZIP/SIP/CSV) → Entpacken → Auswertung → Export als PNG")
+st.caption("Upload (ZIP/SIP/CSV) → Entpacken → Auswertung → PNG/JPG-Export")
 
 
 # ---------- Persistentes Arbeitsverzeichnis ----------
@@ -96,8 +105,8 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     return outp, True
 
 def load_session_relatives(csv_path, agg="power"):
-    """Lädt relative Bandanteile (Delta..Gamma) zeitaufgelöst aus einer CSV mit Kanälen Delta_*, Theta_* usw.
-       Gibt einen DataFrame mit Spalten ['delta','theta','alpha','beta','gamma'] (0..1, zeitsynchron) zurück.
+    """Lädt relative Bandanteile (Delta..Gamma) zeitaufgelöst.
+       Rückgabe: DataFrame ['delta','theta','alpha','beta','gamma'] (0..1).
     """
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -164,8 +173,14 @@ def roll_mean(s, w):  # w >= 1
 def roll_std(s, w):
     return s.rolling(window=max(1, int(w)), center=True, min_periods=1).std()
 
+# ---------- Datei-Helfer ----------
+def find_csv_by_basename(name: str, root_dir: str):
+    """Suche die Original-CSV im Arbeitsordner (rekursiv) anhand des Dateinamens."""
+    paths = [p for p in glob.glob(os.path.join(root_dir, "**", name), recursive=True)]
+    return paths[0] if paths else None
 
-# ---------- Interaktive Plotly-Anzeigen (Sessions-Übersicht) ----------
+
+# ---------- Interaktive Plotly-Anzeigen ----------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
             "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
@@ -224,19 +239,14 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
     return fig
 
 
-# ---------- Zusatz: Einzel-Session mit Zeitachse ----------
-def find_csv_by_basename(name: str, root_dir: str):
-    """Suche die Original-CSV im Arbeitsordner (rekursiv) anhand des Dateinamens."""
-    paths = [p for p in glob.glob(os.path.join(root_dir, "**", name), recursive=True)]
-    return paths[0] if paths else None
-
+# ---------- Einzel-Session: Zeitachse + Kombi ----------
 def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)"):
-    """Zeitlicher Verlauf der relativen Bänder (Delta..Gamma) + Stress/Relax-Wellen über die Session."""
+    """Zeitlicher Verlauf der relativen Bänder + Stress/Relax-Wellen über die Session."""
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
         return go.Figure()
 
-    # Versuche Zeitachse aus CSV zu lesen; sonst aus fs approximieren
+    # Zeitachse lesen; sonst aus fs approximieren
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -269,7 +279,7 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
     rel = rel.iloc[:n].copy()
     t = t[:n]
 
-    # Glättung in Sekunden → Samples
+    # Glättung (Sekunden → Samples)
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
     for c in ["delta", "theta", "alpha", "beta", "gamma"]:
         if c in rel.columns:
@@ -297,8 +307,132 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
         fig.update_yaxes(title="Relativer Anteil")
     return fig
 
+def compose_single_session_plotly(df_single: pd.DataFrame, csv_path: str,
+                                  fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)"):
+    """Plotly-Subplot (oben Balken, unten Zeitverlauf) für EINZEL-Session."""
+    from copy import deepcopy
+    fig_bar = plot_single_session_interactive(df_single)
+    fig_time = plot_single_session_timeline(csv_path, fs=fs, smooth_seconds=smooth_seconds, y_mode=y_mode)
 
-# ---------- „Schönes Rendering“ (Plotly mit Punkt-Schatten) ----------
+    fig = make_subplots(rows=2, cols=1, shared_x=False,
+                        row_heights=[0.35, 0.65], vertical_spacing=0.08,
+                        subplot_titles=("Balkendiagramm", "Zeitverlauf"))
+    for tr in fig_bar.data:
+        fig.add_trace(deepcopy(tr), row=1, col=1)
+    for tr in fig_time.data:
+        fig.add_trace(deepcopy(tr), row=2, col=1)
+
+    fig.update_xaxes(title_text=None, row=1, col=1)
+    fig.update_yaxes(title_text="Wert", row=1, col=1)
+    fig.update_xaxes(title_text="Zeit [s]", row=2, col=1)
+    if y_mode == "0–1 (fix)":
+        fig.update_yaxes(range=[0, 1], title_text="Relativer Anteil", row=2, col=1)
+    else:
+        fig.update_yaxes(title_text="Relativer Anteil", row=2, col=1)
+    fig.update_layout(height=1000, margin=dict(l=40, r=20, t=60, b=60))
+    return fig
+
+def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Series,
+                                                      fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)",
+                                                      outpath="single_combo.png"):
+    """Matplotlib-Fallback: EIN PNG mit 2 Achsen (oben Balken, unten Zeitverlauf)."""
+    vals = {
+        "Stress": float(row["stress"]),
+        "Entspannung": float(row["relax"]),
+        "Delta": float(row["delta"]),
+        "Theta": float(row["theta"]),
+        "Alpha": float(row["alpha"]),
+        "Beta": float(row["beta"]),
+        "Gamma": float(row["gamma"]),
+    }
+
+    # Zeitreihe laden
+    rel = load_session_relatives(csv_path) if csv_path else None
+    if rel is None or rel.empty:
+        # Fallback: Nur Balken rendern
+        fig, ax = plt.subplots(figsize=(16, 10), dpi=110)
+        labels, v = list(vals.keys()), list(vals.values())
+        bars = ax.bar(labels, v)
+        for b, y in zip(bars, v):
+            ax.text(b.get_x()+b.get_width()/2, y, f"{y:.2f}", ha="center", va="bottom")
+        ax.set_ylim(0, max(1.0, max(v)*1.15))
+        ax.set_title("Einzel-Session – Balkendiagramm")
+        fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
+        return outpath
+
+    # Zeitachse
+    try:
+        df0 = pd.read_csv(csv_path, low_memory=False)
+    except Exception:
+        df0 = None
+    t = None
+    if df0 is not None:
+        cand = [c for c in df0.columns if str(c).lower() in
+                ["timestamp","time","timesec","t","elapsed","seconds","secs",
+                 "ms","millis","datetime","date_time","date","zeit"]]
+        for c in cand:
+            s = df0[c]
+            if np.issubdtype(s.dtype, np.number):
+                val = pd.to_numeric(s, errors="coerce").values.astype(float)
+                t = val/1000.0 if ("ms" in c.lower() or "millis" in c.lower()) else val
+                break
+            else:
+                try:
+                    td = pd.to_datetime(s, errors="coerce")
+                    if td.notna().any():
+                        t = (td - td.iloc[0]).dt.total_seconds().values
+                        break
+                except Exception:
+                    pass
+    if t is None:
+        t = np.arange(len(rel)) / fs if fs and fs > 0 else np.arange(len(rel))
+
+    # Angleichen & Glätten
+    n = min(len(rel), len(t))
+    rel = rel.iloc[:n].copy(); t = t[:n]
+    w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
+    for c in ["delta","theta","alpha","beta","gamma"]:
+        if c in rel.columns:
+            rel[c] = roll_mean(rel[c], w)
+    rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
+    rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
+
+    # Zeichnen
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(16, 12), dpi=110, gridspec_kw={"height_ratios":[1,2]})
+
+    # oben: Balken
+    labels, v = list(vals.keys()), list(vals.values())
+    bars = ax1.bar(labels, v)
+    for b, y in zip(bars, v):
+        ax1.text(b.get_x()+b.get_width()/2, y, f"{y:.2f}", ha="center", va="bottom")
+    ax1.set_ylim(0, max(1.0, max(v)*1.15))
+    ax1.set_title("Einzel-Session – Balkendiagramm")
+
+    # unten: Zeitverlauf
+    series = [
+        ("Delta",      rel.get("delta")),
+        ("Theta",      rel.get("theta")),
+        ("Alpha",      rel.get("alpha")),
+        ("Beta",       rel.get("beta")),
+        ("Gamma",      rel.get("gamma")),
+        ("Stress-Welle (Beta+Gamma)",  rel.get("stresswave")),
+        ("Entspannungs-Welle (Alpha+Theta)", rel.get("relaxwave")),
+    ]
+    for name, y in series:
+        if y is not None:
+            ax2.plot(t, y, lw=2.0, label=name)
+    ax2.set_xlabel("Zeit [s]")
+    ax2.set_ylabel("Relativer Anteil")
+    if y_mode == "0–1 (fix)":
+        ax2.set_ylim(0, 1)
+    ax2.legend(loc="best")
+    ax2.set_title("Einzel-Session – Zeitverlauf")
+
+    fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
+    return outpath
+
+
+# ---------- „Schönes Rendering“ (Plotly hübsch) ----------
 def make_beauty_figure(df, kind="stress_relax", smooth=1):
     x = df["date_str"]
     fig = go.Figure()
@@ -316,7 +450,7 @@ def make_beauty_figure(df, kind="stress_relax", smooth=1):
                                  fillcolor='rgba(220,70,70,0.18)', line=dict(width=0),
                                  name="Stress Band", hoverinfo="skip"))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], mode="markers", hoverinfo="skip", showlegend=False,
-                                 marker=dict(size=14, color="rgba(0,0,0,0.20)")))
+                                 marker=dict	size=14, color="rgba(0,0,0,0.20)"))
         fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], name="Stress (Trend)", mode="lines+markers",
                                  line=dict(color='rgb(220,70,70)', width=4),
                                  marker=dict(size=7, color='rgb(220,70,70)')))
@@ -365,7 +499,7 @@ def make_beauty_figure(df, kind="stress_relax", smooth=1):
     raise ValueError("Unknown kind")
 
 
-# ---------- Matplotlib-Fallback-Rendering ----------
+# ---------- Matplotlib-Fallback (Multi-Session) ----------
 def render_png_matplotlib(df, kind="stress_relax", smooth=1, outpath="render.png"):
     plt.style.use("seaborn-v0_8-darkgrid")
     fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
@@ -412,6 +546,68 @@ def render_png_matplotlib(df, kind="stress_relax", smooth=1, outpath="render.png
     return outpath
 
 
+# ---------- Export-Helfer ----------
+def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 90, bg_color=(255, 255, 255)):
+    """Konvertiert PNG nach JPG (entfernt Alpha über weißen Hintergrund)."""
+    if not HAS_PIL:
+        raise RuntimeError("Pillow ist nicht installiert")
+    with Image.open(png_path) as im:
+        if im.mode in ("RGBA", "LA"):
+            bg = Image.new("RGB", im.size, bg_color)
+            bg.paste(im, mask=im.split()[-1])  # Alpha als Maske
+            im = bg
+        else:
+            im = im.convert("RGB")
+        im.save(jpg_path, "JPEG", quality=int(np.clip(quality, 10, 100)))
+    return jpg_path
+
+def save_plotly(fig: go.Figure, out_base: str, fmt: str = "png",
+                width: int = 1600, height: int = 900, scale: int = 3,
+                jpg_quality: int = 90):
+    """Speichert Plotly-Figur als PNG oder JPG (JPG via PNG→JPG-Konvertierung)."""
+    fmt = fmt.lower()
+    os.makedirs(os.path.dirname(out_base), exist_ok=True)
+    if fmt in ("png", "svg", "pdf"):  # native kaleido
+        if not HAS_KALEIDO and fmt != "png":
+            raise RuntimeError(f"Kaleido fehlt für Format {fmt}.")
+        out_path = f"{out_base}.{fmt}"
+        if fmt == "png" and not HAS_KALEIDO:
+            # Kein Kaleido? Versuchen wir orca nicht; lieber Warnung.
+            warnings.warn("Kaleido nicht installiert – PNG-Versuch trotzdem.")
+        pio.write_image(fig, out_path, width=width, height=height, scale=scale, engine="kaleido")
+        return out_path
+    elif fmt in ("jpg", "jpeg"):
+        # erst PNG, dann JPG
+        tmp_png = f"{out_base}__tmp.png"
+        pio.write_image(fig, tmp_png, width=width, height=height, scale=scale, engine="kaleido")
+        out_jpg = f"{out_base}.jpg"
+        try:
+            convert_png_to_jpg(tmp_png, out_jpg, quality=jpg_quality)
+        finally:
+            try: os.remove(tmp_png)
+            except Exception: pass
+        return out_jpg
+    else:
+        raise ValueError("Unbekanntes Exportformat")
+
+def save_matplotlib_png_then_maybe_jpg(make_png_func, out_base: str, fmt: str = "png", jpg_quality: int = 90, **kwargs):
+    """Matplotlib rendert PNG; optional in JPG konvertieren."""
+    out_png = f"{out_base}.png"
+    make_png_func(outpath=out_png, **kwargs)
+    if fmt.lower() in ("jpg", "jpeg"):
+        out_jpg = f"{out_base}.jpg"
+        try:
+            convert_png_to_jpg(out_png, out_jpg, quality=jpg_quality)
+            # Platz sparen: PNG löschen
+            try: os.remove(out_png)
+            except Exception: pass
+            return out_jpg
+        except Exception as e:
+            warnings.warn(f"JPG-Konvertierung fehlgeschlagen ({e}); PNG beibehalten.")
+            return out_png
+    return out_png
+
+
 # ---------- Chart-Baukasten + Cache ----------
 def build_charts(df: pd.DataFrame, smooth: int, y_mode: str):
     charts = {}
@@ -452,13 +648,13 @@ if uploads:
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
-**Glättungsfenster**: 1 = keine Glättung; höhere Werte glätten stärker.  
-**Sampling-Rate**: Nur für Rohdaten-Preprocessing nötig.
+**Glättungsfenster (Sessions)**: 1 = keine Glättung; höhere Werte glätten stärker.  
+**Sampling-Rate**: Nur für Rohdaten-Preprocessing bzw. Zeitachsen-Fallback.
 """)
 smooth = st.slider("Glättungsfenster (Sessions)", 1, 15, 2, 1,
                    help="1 = keine Glättung; höhere Werte glätten stärker")
 y_mode = st.selectbox("Y-Achse für Bänder", ["0–1 (fix)", "Auto (zoom)", "Abweichung vom Mittelwert (%)"], index=0)
-fs = st.number_input("Sampling-Rate für Preprocessing (Hz) / Timeline (Fallback)", value=250.0, step=1.0)
+fs = st.number_input("Sampling-Rate für Preprocessing/Timeline (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
 
 # CSV-Überblick
@@ -575,35 +771,94 @@ if not df_show.empty:
                        file_name="summary_indices.csv", mime="text/csv")
 
 
-# ---------- 4) Export (PNG) ----------
+# ---------- 4) Export ----------
 st.subheader("Export")
 if df_show.empty:
     st.info("Keine Auswertung im Speicher. Erst „Auswertung starten“.")
 else:
-    render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
-    render_btn  = st.button("PNG rendern", key="render_btn")
-    st.session_state.setdefault("render_path", "")
+    export_fmt = st.selectbox("Exportformat", ["JPG (kleiner)", "PNG (verlustfrei)"], index=0)
+    exp_is_jpg = export_fmt.startswith("JPG")
+    jpg_quality = st.slider("JPG-Qualität", 60, 100, 90, 1, help="Nur relevant für JPG", disabled=not exp_is_jpg)
 
-    if render_btn:
-        kind = "stress_relax" if "Stress" in render_kind else "bands"
-        outdir = os.path.join(workdir, "exports"); os.makedirs(outdir, exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        png_path = os.path.join(outdir, f"render_{kind}_{ts}.png")
-        try:
-            if not HAS_KALEIDO:
-                raise RuntimeError("Kaleido nicht installiert")
-            fig = make_beauty_figure(df_show, kind=kind, smooth=smooth)
-            pio.write_image(fig, png_path, width=1600, height=900, scale=3, engine="kaleido")
-        except Exception:
-            png_path = render_png_matplotlib(df_show, kind=kind, smooth=smooth, outpath=png_path)
-        st.session_state["render_path"] = png_path
-        st.success(f"PNG erzeugt: {png_path}")
+    if len(df_show) == 1:
+        # EINZEL-SESSION: Balken + Zeitverlauf als EIN Bild
+        st.markdown("**Einzel-Session-Export (Balkendiagramm + Zeitverlauf)**")
+        exp_smooth = st.slider("Glättung (Sekunden) für Export", 0, 30, 3, 1, key="exp_smooth_single")
+        exp_y = st.selectbox("Y-Achse (Export)", ["0–1 (fix)", "Auto (zoom)"], index=0, key="exp_y_single")
+        render_btn_single = st.button("Bild rendern", key="render_btn_single")
+        st.session_state.setdefault("render_path", "")
 
-    if st.session_state.get("render_path") and os.path.isfile(st.session_state["render_path"]):
-        p = st.session_state["render_path"]
-        st.image(p, caption="Rendering-Vorschau (PNG)", use_container_width=True)
-        with open(p, "rb") as f:
-            st.download_button("PNG herunterladen", f, file_name=os.path.basename(p), mime="image/png")
+        if render_btn_single:
+            outdir = os.path.join(workdir, "exports"); os.makedirs(outdir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(outdir, f"single_combo_{ts}")
+            csv_name = df_show.iloc[0]["source"]
+            csv_path = find_csv_by_basename(csv_name, workdir)
+            try:
+                if HAS_KALEIDO and csv_path:
+                    combo = compose_single_session_plotly(df_show.iloc[:1], csv_path,
+                                                          fs=fs, smooth_seconds=exp_smooth, y_mode=exp_y)
+                    fmt = "jpg" if exp_is_jpg else "png"
+                    out_path = save_plotly(combo, base, fmt=fmt, width=1600, height=1200, scale=3,
+                                           jpg_quality=jpg_quality)
+                else:
+                    # Fallback (kein Kaleido oder CSV nicht gefunden)
+                    if not csv_path:
+                        st.warning("Original-CSV nicht gefunden – rendere ggf. nur Balkendiagramm im Fallback.")
+                    out_path = save_matplotlib_png_then_maybe_jpg(
+                        make_png_func=render_single_session_bar_and_timeline_matplotlib,
+                        out_base=base,
+                        fmt=("jpg" if exp_is_jpg else "png"),
+                        jpg_quality=jpg_quality,
+                        csv_path=(csv_path if csv_path else ""),
+                        row=df_show.iloc[0],
+                        fs=fs,
+                        smooth_seconds=exp_smooth,
+                        y_mode=exp_y
+                    )
+                st.session_state["render_path"] = out_path
+                st.success(f"Bild erzeugt: {out_path}")
+            except Exception as e:
+                st.error(f"Export fehlgeschlagen: {e}")
+
+    else:
+        # MEHRERE SESSIONS
+        render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
+        render_btn  = st.button("Bild rendern", key="render_btn")
+        st.session_state.setdefault("render_path", "")
+
+        if render_btn:
+            kind = "stress_relax" if "Stress" in render_kind else "bands"
+            outdir = os.path.join(workdir, "exports"); os.makedirs(outdir, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            base = os.path.join(outdir, f"render_{kind}_{ts}")
+            try:
+                if HAS_KALEIDO:
+                    fig = make_beauty_figure(df_show, kind=kind, smooth=smooth)
+                    fmt = "jpg" if exp_is_jpg else "png"
+                    out_path = save_plotly(fig, base, fmt=fmt, width=1600, height=900, scale=3,
+                                           jpg_quality=jpg_quality)
+                else:
+                    out_path = save_matplotlib_png_then_maybe_jpg(
+                        make_png_func=render_png_matplotlib,
+                        out_base=base,
+                        fmt=("jpg" if exp_is_jpg else "png"),
+                        jpg_quality=jpg_quality,
+                        df=df_show, kind=kind, smooth=smooth
+                    )
+                st.session_state["render_path"] = out_path
+                st.success(f"Bild erzeugt: {out_path}")
+            except Exception as e:
+                st.error(f"Export fehlgeschlagen: {e}")
+
+# Gemeinsame Vorschau + Download
+if st.session_state.get("render_path") and os.path.isfile(st.session_state["render_path"]):
+    p = st.session_state["render_path"]
+    st.image(p, caption="Rendering-Vorschau", use_container_width=True)
+    with open(p, "rb") as f:
+        st.download_button(("JPG herunterladen" if p.lower().endswith(".jpg") else "PNG herunterladen"),
+                           f, file_name=os.path.basename(p),
+                           mime=("image/jpeg" if p.lower().endswith(".jpg") else "image/png"))
 
 
 # ---------- Wartung ----------
