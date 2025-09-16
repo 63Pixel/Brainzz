@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 # EEG-Auswertung – Streamlit-App
 #
-# Features:
-# - JPG-Export (Qualität 80%)
-# - Dateiname beim Download = Session-Basisname
-# - Zeitachse zeigt Uhrzeit aus CSV (wenn vorhanden)
-# - Schattierung + sparse markers für bessere Lesbarkeit
-# - Kaleido ohne 'engine' (Deprecation fix); Matplotlib-Fallback
+# Änderungen:
+# - Export immer als JPG (Qualität 80%)
+# - Dateiname beim Download = sessionname (CSV-Basisname)
+# - Zeitachse der Einzel-Session zeigt Uhrzeit aus CSV (falls vorhanden)
+# - Leichte Schattierung & Marker in Plots
+# - Robuster Kaleido/Matplotlib-Fallback
 
 import os
 import re
@@ -36,7 +36,7 @@ except Exception:
 # optional: Plotly→Kaleido
 try:
     import kaleido  # noqa: F401
-    HAS_KALEIDO = False
+    HAS_KALEIDO = True
 except Exception:
     HAS_KALEIDO = False
 
@@ -52,11 +52,9 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
 st.caption("Upload (ZIP/SIP/CSV) → Auswertung → JPG-Export (Qualität 80%)")
-
 
 # ---------- Arbeitsverzeichnis ----------
 def get_workdir():
@@ -65,7 +63,6 @@ def get_workdir():
     return st.session_state["workdir"]
 
 workdir = get_workdir()
-
 
 # ---------- Helfer ----------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
@@ -189,7 +186,6 @@ def find_csv_by_basename(name: str, root_dir: str):
     paths = [p for p in glob.glob(os.path.join(root_dir, "**", name), recursive=True)]
     return paths[0] if paths else None
 
-
 # ---------- Plot-Funktionen ----------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
@@ -206,13 +202,11 @@ def plot_stress_relax(df, smooth=1):
     d = df.copy()
     d["stress_trend"] = roll_mean(d["stress"], smooth)
     d["relax_trend"]  = roll_mean(d["relax"],  smooth)
-    long = d.melt(id_vars=["date_str"], value_vars=["stress_trend", "relax_trend"],
+    long = d.melt(id_vars=["date_str"], value_vars=["stress", "relax", "stress_trend", "relax_trend"],
                   var_name="Metrik", value_name="Wert")
-    # plotly express ohne marker
-    fig = px.line(long, x="date_str", y="Wert", color="Metrik", markers=False, height=360)
-    fig.update_layout(xaxis=dict(type="category"), showlegend=True)
+    fig = px.line(long, x="date_str", y="Wert", color="Metrik", markers=True, height=360)
+    fig.update_layout(xaxis=dict(type="category"))
     return fig
-
 
 def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
     d = df.copy()
@@ -220,59 +214,26 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
     d["relaxwave"]  = d["alpha"] + d["theta"]
     for c in ["delta", "theta", "alpha", "beta", "gamma", "stresswave", "relaxwave"]:
         d[f"{c}_trend"] = roll_mean(d[c], smooth)
-        d[f"{c}_std"] = roll_std(d[c], smooth).fillna(0)
 
-    long_items = []
+    long = d.melt(
+        id_vars=["date_str"],
+        value_vars=["delta_trend", "theta_trend", "alpha_trend", "beta_trend", "gamma_trend",
+                    "stresswave_trend", "relaxwave_trend"],
+        var_name="Band", value_name="Wert"
+    )
     name_map = {
         "delta_trend": "Delta", "theta_trend": "Theta", "alpha_trend": "Alpha", "beta_trend": "Beta",
         "gamma_trend": "Gamma", "stresswave_trend": "Stress-Welle (Beta+Gamma)",
         "relaxwave_trend": "Entspannungs-Welle (Alpha+Theta)"
     }
+    long["Band"] = long["Band"].map(name_map)
 
-    # build traces similar to make_beauty_figure but using px.line for convenience is less flexible,
-    # so use go.Figure assembling here
-    fig = go.Figure()
-    palette = {
-        "delta_trend": "rgb(100,149,237)",
-        "theta_trend": "rgb(128,0,128)",
-        "alpha_trend": "rgb(34,139,34)",
-        "beta_trend":  "rgb(255,165,0)",
-        "gamma_trend": "rgb(220,20,60)",
-        "stresswave_trend": "rgb(220,120,60)",
-        "relaxwave_trend": "rgb(60,200,180)"
-    }
+    if y_mode == "Abweichung vom Mittelwert (%)":
+        long["Wert"] = long.groupby("Band")["Wert"].transform(lambda s: (s / (s.mean() + 1e-12) - 1.0) * 100.0)
 
-    x = d["date_str"]
+    fig = px.line(long, x="date_str", y="Wert", color="Band", markers=True, height=380)
+    fig.update_layout(xaxis=dict(type="category"))
 
-    for key, label in name_map.items():
-        if key not in d:
-            continue
-        base = key.replace("_trend", "")
-        ci_y1 = (d[key] + d[f"{base}_std"]).tolist()
-        ci_y2 = (d[key] - d[f"{base}_std"]).tolist()[::-1]
-        # CI
-        fig.add_trace(go.Scatter(
-            x=list(x) + list(x[::-1]),
-            y=ci_y1 + ci_y2,
-            fill="toself",
-            fillcolor="rgba(150,150,150,0.08)",
-            line=dict(width=0),
-            hoverinfo="skip",
-            showlegend=False
-        ))
-        # subtle shadow
-        fig.add_trace(go.Scatter(x=x, y=d[key], mode="lines",
-                                 line=dict(color="rgba(0,0,0,0.06)", width=6),
-                                 hoverinfo="skip", showlegend=False))
-        # main line
-        color = palette.get(key, "rgb(100,100,100)")
-        fig.add_trace(go.Scatter(x=x, y=d[key], mode="lines",
-                                 line=dict(color=color, width=3.0),
-                                 name=label))
-
-    fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=40),
-                      xaxis=dict(type="category"),
-                      xaxis_title="Datum")
     if y_mode == "0–1 (fix)":
         fig.update_yaxes(range=[0, 1], title="Wert")
     elif y_mode == "Auto (zoom)":
@@ -280,114 +241,118 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
     else:
         fig.update_yaxes(title="Δ zum Mittelwert [%]")
         fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
+
     return fig
 
-
-
-# ---------- Einzel-Session: Zeitachse als Uhrzeit (sparse markers) ----------
+# ---------- Einzel-Session: Zeitachse als Uhrzeit ----------
 def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)"):
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
         return go.Figure()
 
-    # CSV laden (versuche datetime-Spalte)
+    # CSV laden (versuchen Zeitstempel zu finden)
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
         df0 = None
 
-    x_vals = None
-    is_datetime = False
+    t_values = None
+    t_is_datetime = False
     if df0 is not None:
+        # candidate columns likely containing time/datetime
         cand = [c for c in df0.columns if str(c).lower() in
-                ["timestamp","time","timesec","t","elapsed","seconds","secs",
-                 "ms","millis","datetime","date_time","date","zeit","clock","uhrzeit"]]
+                ["timestamp", "time", "timesec", "t", "elapsed", "seconds", "secs",
+                 "ms", "millis", "datetime", "date_time", "date", "zeit", "clock", "uhrzeit"]]
         for c in cand:
             s = df0[c]
+            # numeric? maybe seconds or ms
             if np.issubdtype(s.dtype, np.number):
-                val = pd.to_numeric(s, errors="coerce").astype(float)
+                val = pd.to_numeric(s, errors="coerce").values.astype(float)
+                # if looks like ms (large numbers), treat as ms
                 if np.nanmax(val) > 1e6:
-                    try:
-                        x_vals = pd.to_datetime(val, unit="ms")
-                        is_datetime = True
-                        break
-                    except Exception:
-                        pass
+                    t_values = pd.to_timedelta(val, unit="ms") + pd.Timestamp(0)
                 else:
-                    try:
-                        x_vals = pd.to_datetime(val, unit="s")
-                        is_datetime = True
-                        break
-                    except Exception:
-                        pass
+                    t_values = pd.to_timedelta(val, unit="s") + pd.Timestamp(0)
+                # we will convert to seconds relative later, but mark as not datetime
+                t_is_datetime = False
+                break
             else:
+                # try parse as datetimes
                 try:
                     td = pd.to_datetime(s, errors="coerce")
                     if td.notna().any():
-                        x_vals = td
-                        is_datetime = True
+                        # convert to actual datetimes (absolute)
+                        t_values = td
+                        t_is_datetime = True
                         break
                 except Exception:
                     pass
 
-    # fallback: relative seconds as datetimes for prettier labels
-    if x_vals is None:
-        secs = np.arange(len(rel)) / (fs if fs and fs > 0 else 1.0)
-        x_vals = pd.to_datetime(secs, unit="s", origin=pd.Timestamp("1970-01-01"))
-        is_datetime = True
+    # fallback: use index -> seconds from 0
+    if t_values is None:
+        t_values = pd.to_timedelta(np.arange(len(rel)) / fs, unit="s")
+        t_is_datetime = False
 
-    n = min(len(rel), len(x_vals))
-    rel = rel.iloc[:n].copy()
-    x_vals = pd.Series(x_vals).iloc[:n].reset_index(drop=True)
+    # align lengths
+    if t_is_datetime:
+        # If datetime, make sure rel length matches
+        n = min(len(rel), len(t_values))
+        rel = rel.iloc[:n].copy()
+        t_vals = t_values.iloc[:n]
+        # format for plotly
+        x_vals = t_vals.dt.strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        # t_values is timedelta-like or numeric fallback
+        if isinstance(t_values, pd.Series) and pd.api.types.is_timedelta64_dtype(t_values.dtype):
+            # make relative seconds and then display as H:M:S starting from 00:00:00
+            base = pd.Timestamp("1970-01-01")
+            if len(t_values) > 0 and isinstance(t_values.iloc[0], pd.Timedelta):
+                dt_series = (base + t_values).dt.strftime("%H:%M:%S")
+            else:
+                dt_series = pd.Series([str(x) for x in t_values])
+        elif isinstance(t_values, np.ndarray):
+            dt_series = pd.Series((pd.Timestamp("1970-01-01") + pd.to_timedelta(t_values, unit="s")).strftime("%H:%M:%S"))
+        else:
+            # last fallback: index seconds
+            dt_series = pd.Series((pd.Timestamp("1970-01-01") + pd.to_timedelta(np.arange(len(rel))/fs, unit="s")).strftime("%H:%M:%S"))
 
+        n = min(len(rel), len(dt_series))
+        rel = rel.iloc[:n].copy()
+        x_vals = dt_series.iloc[:n].values
+
+    # smoothing
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
-    for c in ["delta","theta","alpha","beta","gamma"]:
+    for c in ["delta", "theta", "alpha", "beta", "gamma"]:
         if c in rel.columns:
             rel[c] = roll_mean(rel[c], w)
     rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
 
-    bands_map = {
-        "delta":"Delta","theta":"Theta","alpha":"Alpha",
-        "beta":"Beta","gamma":"Gamma",
-        "stresswave":"Stress-Welle (Beta+Gamma)","relaxwave":"Entspannungs-Welle (Alpha+Theta)"
+    long = rel.copy()
+    long["t_label"] = x_vals
+    long = long.melt(id_vars=["t_label"],
+                     value_vars=["delta","theta","alpha","beta","gamma","stresswave","relaxwave"],
+                     var_name="Band", value_name="Wert")
+    name_map = {
+        "delta": "Delta", "theta": "Theta", "alpha": "Alpha", "beta": "Beta", "gamma": "Gamma",
+        "stresswave": "Stress-Welle (Beta+Gamma)",
+        "relaxwave": "Entspannungs-Welle (Alpha+Theta)"
     }
+    long["Band"] = long["Band"].map(name_map)
 
-    fig = go.Figure()
-    # For performance: only two traces per series (shadow + main line)
-    for key, label in bands_map.items():
-        if key not in rel.columns:
-            continue
-        y = rel[key].values
-        # shadow (broad faint line)
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=y, mode="lines", showlegend=False, hoverinfo="skip",
-            line=dict(color="rgba(0,0,0,0.06)", width=8)
-        ))
-        # main line
-        fig.add_trace(go.Scatter(
-            x=x_vals, y=y, mode="lines", name=label, line=dict(width=2)
-        ))
-
-    fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=40))
-    if is_datetime:
-        fig.update_xaxes(title_text="Uhrzeit", tickformat="%H:%M:%S", tickangle=45)
-    else:
-        fig.update_xaxes(title_text="Zeit [s]", tickangle=45)
+    # plot with x as the formatted datetime/time string
+    fig = px.line(long, x="t_label", y="Wert", color="Band", height=380)
+    fig.update_layout(xaxis_title="Uhrzeit", xaxis=dict(tickangle=45))
     if y_mode == "0–1 (fix)":
-        fig.update_yaxes(range=[0,1], title="Relativer Anteil")
+        fig.update_yaxes(range=[0, 1], title="Relativer Anteil")
     else:
         fig.update_yaxes(title="Relativer Anteil")
+    # add markers lightly
+    fig.update_traces(mode="lines+markers")
     return fig
 
-
-# ---------- hübsche Plotly-Renderings mit Schattierung & sparse markers ----------
+# ---------- hübsche Plotly-Renderings mit Schattierung & Markern ----------
 def make_beauty_figure(df, kind="stress_relax", smooth=1):
-    """
-    Plotly figure: klare Linien + halbtransparente Konfidenzbänder (+/-1 std),
-    dezenter Schatten (breite, sehr blasse Linie) hinter den Hauptlinien.
-    X-Achse als Kategorie (Datum) -> bleibt stabil.
-    """
     x = df["date_str"]
     fig = go.Figure()
 
@@ -398,110 +363,77 @@ def make_beauty_figure(df, kind="stress_relax", smooth=1):
         d["stress_std"]   = roll_std(d["stress"], smooth).fillna(0)
         d["relax_std"]    = roll_std(d["relax"],  smooth).fillna(0)
 
-        # Stress CI (fill)
-        fig.add_trace(go.Scatter(
-            x=list(x) + list(x[::-1]),
-            y=list((d["stress_trend"] + d["stress_std"])) + list((d["stress_trend"] - d["stress_std"])[::-1]),
-            fill="toself",
-            fillcolor="rgba(220,70,70,0.12)",
-            line=dict(width=0),
-            hoverinfo="skip",
-            showlegend=False,
-            name="Stress CI"
-        ))
-        # subtle shadow
-        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"],
-                                 mode="lines",
+        # shadow (thin grey area behind stress line)
+        fig.add_trace(go.Scatter(x=x, y=(d["stress_trend"] + d["stress_std"]).tolist(),
+                                 line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=(d["stress_trend"] - d["stress_std"]).tolist(),
+                                 fill="tonexty", fillcolor="rgba(220,70,70,0.18)",
+                                 line=dict(width=0), name="Stress Band", hoverinfo="skip"))
+
+        # shadow trace behind main line (subtle)
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], mode="lines",
                                  line=dict(color="rgba(0,0,0,0.06)", width=8),
                                  hoverinfo="skip", showlegend=False))
-        # main line
-        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"],
-                                 mode="lines",
+
+        fig.add_trace(go.Scatter(x=x, y=d["stress_trend"], name="Stress (Trend)",
+                                 mode="lines+markers",
                                  line=dict(color="rgb(220,70,70)", width=3.5),
-                                 name="Stress (Trend)"))
+                                 marker=dict(size=8, color="rgb(220,70,70)")))
 
-        # Relax CI
-        fig.add_trace(go.Scatter(
-            x=list(x) + list(x[::-1]),
-            y=list((d["relax_trend"] + d["relax_std"])) + list((d["relax_trend"] - d["relax_std"])[::-1]),
-            fill="toself",
-            fillcolor="rgba(70,170,70,0.12)",
-            line=dict(width=0),
-            hoverinfo="skip",
-            showlegend=False,
-            name="Relax CI"
-        ))
-        # subtle shadow
-        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"],
-                                 mode="lines",
+        # Relax band
+        fig.add_trace(go.Scatter(x=x, y=(d["relax_trend"] + d["relax_std"]).tolist(),
+                                 line=dict(width=0), hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=x, y=(d["relax_trend"] - d["relax_std"]).tolist(),
+                                 fill="tonexty", fillcolor="rgba(70,170,70,0.18)",
+                                 line=dict(width=0), name="Entspannung Band", hoverinfo="skip"))
+
+        # shadow behind relax
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"], mode="lines",
                                  line=dict(color="rgba(0,0,0,0.06)", width=8),
                                  hoverinfo="skip", showlegend=False))
-        # main line
-        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"],
-                                 mode="lines",
-                                 line=dict(color="rgb(70,170,70)", width=3.5),
-                                 name="Entspannung (Trend)"))
 
-        fig.update_layout(
-            height=640,
-            margin=dict(l=40, r=20, t=60, b=60),
-            title="Stress- und Entspannungs-Trend",
-            xaxis=dict(type="category", tickangle=45, title="Datum"),
-            yaxis=dict(title="Index")
-        )
+        fig.add_trace(go.Scatter(x=x, y=d["relax_trend"], name="Entspannung (Trend)",
+                                 mode="lines+markers",
+                                 line=dict(color="rgb(70,170,70)", width=3.5),
+                                 marker=dict(size=8, color="rgb(70,170,70)")))
+
+        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
+                          title="Stress- und Entspannungs-Trend",
+                          xaxis=dict(type="category", tickangle=45, title="Datum"),
+                          yaxis=dict(title="Index"))
         return fig
 
     if kind == "bands":
         d = df.copy()
         for c in ["delta", "theta", "alpha", "beta", "gamma"]:
             d[f"{c}_trend"] = roll_mean(d[c], smooth)
-            d[f"{c}_std"] = roll_std(d[c], smooth).fillna(0)
 
         palette = {
             "delta_trend": ("Delta", "rgb(100,149,237)"),
-            "theta_trend": ("Theta", "rgb(128,0,128)"),
+            "theta_trend": ("Theta", "rgb(72,61,139)"),
             "alpha_trend": ("Alpha", "rgb(34,139,34)"),
             "beta_trend":  ("Beta",  "rgb(255,165,0)"),
             "gamma_trend": ("Gamma", "rgb(220,20,60)")
         }
 
         for key, (label, color) in palette.items():
-            base = key.replace("_trend", "")
-            ci_y1 = (d[key] + d[f"{base}_std"]).tolist()
-            ci_y2 = (d[key] - d[f"{base}_std"]).tolist()[::-1]
-            # CI polygon
-            fig.add_trace(go.Scatter(
-                x=list(x) + list(x[::-1]),
-                y=ci_y1 + ci_y2,
-                fill="toself",
-                fillcolor=f"rgba(200,200,200,0.10)",
-                line=dict(width=0),
-                hoverinfo="skip",
-                showlegend=False
-            ))
-            # subtle shadow
+            # subtle shadow behind line
             fig.add_trace(go.Scatter(x=x, y=d[key], mode="lines",
                                      line=dict(color="rgba(0,0,0,0.06)", width=6),
                                      hoverinfo="skip", showlegend=False))
-            # main line
-            fig.add_trace(go.Scatter(x=x, y=d[key],
-                                     mode="lines",
-                                     line=dict(color=color, width=3.2),
-                                     name=label))
-        fig.update_layout(
-            height=640,
-            margin=dict(l=40, r=20, t=60, b=60),
-            title="EEG-Bänder (Trendlinien)",
-            xaxis=dict(type="category", tickangle=45, title="Datum"),
-            yaxis=dict(title="Relativer Anteil", range=[0, 1])
-        )
+            fig.add_trace(go.Scatter(x=x, y=d[key], name=label, mode="lines+markers",
+                                     line=dict(color=color, width=3.5),
+                                     marker=dict(size=7, color=color)))
+
+        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
+                          title="EEG-Bänder (Trendlinien)",
+                          xaxis=dict(type="category", tickangle=45, title="Datum"),
+                          yaxis=dict(title="Relativer Anteil", range=[0, 1]))
         return fig
 
     raise ValueError("Unknown kind")
 
-
-
-# ---------- Matplotlib-Fallback-Renderer ----------
+# ---------- Matplotlib-Fallback-Renderer für Einzel/Multi ----------
 def render_png_matplotlib(df, kind="stress_relax", smooth=1, outpath="render.png"):
     plt.style.use("seaborn-v0_8-darkgrid")
     fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
@@ -519,37 +451,32 @@ def render_png_matplotlib(df, kind="stress_relax", smooth=1, outpath="render.png
                         alpha=0.20, color=(0.86, 0.27, 0.27))
         ax.fill_between(x, d["relax_trend"]-d["relax_std"], d["relax_trend"]+d["relax_std"],
                         alpha=0.20, color=(0.27, 0.67, 0.27))
-        # shadow (broad faint)
-        ax.plot(x, d["stress_trend"], c=(0,0,0,0.06), lw=8, zorder=1)
-        ax.plot(x, d["relax_trend"], c=(0,0,0,0.06), lw=8, zorder=1)
-        # main lines (no heavy markers)
-        ax.plot(x, d["stress_trend"], c=(0.86, 0.27, 0.27), lw=3.5, zorder=2, label="Stress (Trend)")
-        ax.plot(x, d["relax_trend"], c=(0.27, 0.67, 0.27), lw=3.5, zorder=2, label="Entspannung (Trend)")
+        ax.plot(x, d["stress_trend"], c=(0.86, 0.27, 0.27), lw=3.5, zorder=3, label="Stress (Trend)")
+        ax.scatter(x, d["stress_trend"], s=80, c=(0.86, 0.27, 0.27), zorder=4)
+        ax.plot(x, d["relax_trend"], c=(0.27, 0.67, 0.27), lw=3.5, zorder=3, label="Entspannung (Trend)")
+        ax.scatter(x, d["relax_trend"], s=80, c=(0.27, 0.67, 0.27), zorder=4)
         ax.legend(loc="best"); ax.set_ylabel("Index"); ax.set_title("Stress- und Entspannungs-Trend")
 
     elif kind == "bands":
         d = df.copy()
         for c in ["delta", "theta", "alpha", "beta", "gamma"]:
             d[f"{c}_trend"] = roll_mean(d[c], smooth)
-            d[f"{c}_std"] = roll_std(d[c], smooth).fillna(0)
         series = [
-            ("Delta", d["delta_trend"], d["delta_std"], (0.39, 0.58, 0.93)),
-            ("Theta", d["theta_trend"], d["theta_std"], (0.28, 0.24, 0.55)),
-            ("Alpha", d["alpha_trend"], d["alpha_std"], (0.13, 0.55, 0.13)),
-            ("Beta",  d["beta_trend"], d["beta_std"], (1.00, 0.65, 0.00)),
-            ("Gamma", d["gamma_trend"], d["gamma_std"], (0.86, 0.08, 0.24)),
+            ("Delta", d["delta_trend"], (0.39, 0.58, 0.93)),
+            ("Theta", d["theta_trend"], (0.28, 0.24, 0.55)),
+            ("Alpha", d["alpha_trend"], (0.13, 0.55, 0.13)),
+            ("Beta",  d["beta_trend"],  (1.00, 0.65, 0.00)),
+            ("Gamma", d["gamma_trend"], (0.86, 0.08, 0.24)),
         ]
-        for label, y, std, col in series:
-            ax.fill_between(x, y-std, y+std, alpha=0.12, color=col)
-            ax.plot(x, y, lw=3, c=col, zorder=3, label=label)
+        for label, y, col in series:
+            ax.plot(np.arange(len(y)), y, lw=3, c=col, zorder=3, label=label)
+            ax.scatter(np.arange(len(y)), y, s=64, c=[col], zorder=4)
         ax.set_ylim(0, 1); ax.set_ylabel("Relativer Anteil")
         ax.set_title("EEG-Bänder (Trendlinien)"); ax.legend(loc="best")
 
     ax.set_xticks(x); ax.set_xticklabels(xticks, rotation=45, ha="right")
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
-
-
 
 def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Series,
                                                       fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)",
@@ -627,7 +554,8 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
     ]
     for name, y in series:
         if y is not None:
-            ax2.plot(t, y, lw=2.0, label=name)   # nur Linie, kein scatter
+            ax2.plot(t, y, lw=2.0, label=name)
+            ax2.scatter(t, y, s=36)
     ax2.set_xlabel("Uhrzeit")
     ax2.set_xticks(t)
     ax2.set_xticklabels(time_labels[:n], rotation=45)
@@ -639,8 +567,6 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
 
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
-
-
 
 # ---------- PNG->JPG Konvertierung (Pillow) ----------
 def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color=(255,255,255)):
@@ -656,15 +582,14 @@ def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color
         im.save(jpg_path, "JPEG", quality=int(np.clip(quality, 10, 100)))
     return jpg_path
 
-
-# ---------- Plotly save -> PNG -> JPG (ohne engine=) ----------
 def save_plotly_as_jpg(fig: go.Figure, out_base: str, width=1600, height=1200, scale=3, jpg_quality=80):
-    """Speichert Plotly-Figur: write_image -> tmp PNG -> JPG (Pillow)."""
+    """Versuche Plotly + Kaleido -> PNG -> JPG. Falls Fehler, raise."""
     tmp_png = f"{out_base}__tmp.png"
     out_jpg = f"{out_base}.jpg"
     try:
-        # write_image ohne engine argument (kaleido wird verwendet, falls vorhanden)
-        pio.write_image(fig, tmp_png, width=width, height=height, scale=scale)
+        # write PNG via kaleido
+        pio.write_image(fig, tmp_png, width=width, height=height, scale=scale, engine="kaleido")
+        # convert to JPG
         if not HAS_PIL:
             raise RuntimeError("Pillow nicht installiert")
         convert_png_to_jpg(tmp_png, out_jpg, quality=jpg_quality)
@@ -673,14 +598,14 @@ def save_plotly_as_jpg(fig: go.Figure, out_base: str, width=1600, height=1200, s
         except Exception:
             pass
         return out_jpg
-    except Exception:
+    except Exception as e:
+        # cleanup tmp if exists
         try:
             if os.path.isfile(tmp_png):
                 os.remove(tmp_png)
         except Exception:
             pass
-        raise
-
+        raise e
 
 def save_matplotlib_then_jpg(make_png_func, out_base: str, jpg_quality=80, **kwargs):
     out_png = f"{out_base}.png"
@@ -688,15 +613,12 @@ def save_matplotlib_then_jpg(make_png_func, out_base: str, jpg_quality=80, **kwa
     out_jpg = f"{out_base}.jpg"
     try:
         convert_png_to_jpg(out_png, out_jpg, quality=jpg_quality)
-        try:
-            os.remove(out_png)
-        except Exception:
-            pass
+        try: os.remove(out_png)
+        except Exception: pass
         return out_jpg
     except Exception:
-        # fallback: keep PNG if conversion fails
+        # if Pillow missing, keep PNG
         return out_png
-
 
 # ---------- Chart-Baukasten ----------
 def build_charts(df: pd.DataFrame, smooth: int, y_mode: str):
@@ -707,7 +629,6 @@ def build_charts(df: pd.DataFrame, smooth: int, y_mode: str):
         charts["stress"] = plot_stress_relax(df, smooth=smooth)
         charts["bands"]  = plot_bands(df, smooth=smooth, y_mode=y_mode)
     return charts
-
 
 # ---------- UI: Upload & Params ----------
 st.subheader("1) Datei-Upload")
@@ -734,7 +655,6 @@ if uploads:
     recursively_extract_archives(workdir)
     st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
 
-
 st.subheader("2) Parameter / QC")
 with st.expander("Hilfe zu Parametern", expanded=False):
     st.markdown("""
@@ -756,7 +676,6 @@ if "df_summary" in st.session_state and not st.session_state["df_summary"].empty
         st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, y_mode)
         st.session_state["last_smooth"] = smooth
         st.session_state["last_y_mode"]  = y_mode
-
 
 # ---------- Auswertung ----------
 if st.button("Auswertung starten"):
@@ -812,7 +731,6 @@ if st.button("Auswertung starten"):
             for f in failed:
                 st.warning(f"{f['source']}: {f['reason']}")
 
-
 # ---------- Anzeige ----------
 df_show = st.session_state.get("df_summary", pd.DataFrame())
 charts  = st.session_state.get("charts", {})
@@ -854,7 +772,6 @@ if not df_show.empty:
                        data=df_out.to_csv(index=False).encode("utf-8"),
                        file_name="summary_indices.csv", mime="text/csv")
 
-
 # ---------- Export (nur JPG, Qualität 80%) ----------
 st.subheader("Export (JPG, Qualität 80%)")
 if df_show.empty:
@@ -876,6 +793,8 @@ else:
             try:
                 # Prefer Plotly + Kaleido, fallback to Matplotlib if any error
                 if HAS_KALEIDO and csv_path:
+                    combo = None
+                    # create combined plotly figure
                     from copy import deepcopy
                     # top: bar
                     fig_bar = plot_single_session_interactive(df_show)
@@ -891,6 +810,7 @@ else:
                     combo.update_layout(height=1200, margin=dict(l=40, r=20, t=60, b=60))
                     out_path = save_plotly_as_jpg(combo, base, width=1600, height=1200, scale=3, jpg_quality=80)
                 else:
+                    # Matplotlib fallback that creates combined PNG then JPG
                     out_path = save_matplotlib_then_jpg(
                         make_png_func=render_single_session_bar_and_timeline_matplotlib,
                         out_base=base,
@@ -902,6 +822,7 @@ else:
                         y_mode=exp_y
                     )
                 st.session_state["render_path"] = out_path
+                # ensure download filename is sessionbase + .jpg
                 st.success(f"Bild erzeugt: {out_path}")
             except Exception as e:
                 # fallback: try Matplotlib if Plotly/Kaleido failed
@@ -922,6 +843,7 @@ else:
                     st.error(f"Export fehlgeschlagen: {e}; Fallback fehlgeschlagen: {e2}")
 
     else:
+        # multiple sessions: render summary figure and export as jpg
         render_kind = st.selectbox("Motiv", ["Stress/Entspannung (Trend)", "Bänder (Trend)"], key="render_kind")
         render_btn  = st.button("JPG rendern", key="render_btn")
         st.session_state.setdefault("render_path", "")
@@ -956,18 +878,17 @@ else:
                 except Exception as e2:
                     st.error(f"Export fehlgeschlagen: {e}; Fallback fehlgeschlagen: {e2}")
 
-
 # Vorschau + Download
 if st.session_state.get("render_path") and os.path.isfile(st.session_state["render_path"]):
     p = st.session_state["render_path"]
     st.image(p, caption="Rendering-Vorschau", use_container_width=True)
-    # Set download name: for single session, we used sessionbase; otherwise keep filename but ensure .jpg
+    # set download name: if single session, use session base; else use file basename
     download_name = os.path.basename(p)
+    # ensure jpg extension for download
     if not download_name.lower().endswith(".jpg"):
         download_name = os.path.splitext(download_name)[0] + ".jpg"
     with open(p, "rb") as f:
         st.download_button("JPG herunterladen", f, file_name=download_name, mime="image/jpeg")
-
 
 # Wartung
 with st.expander("Debug / Wartung", expanded=False):
