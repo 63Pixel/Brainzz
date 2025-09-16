@@ -346,21 +346,40 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
         fig.update_yaxes(title="Relativer Anteil")
     return fig
 
+
+def decimate_series(y, max_points=800):
+    """
+    Reduziert die Anzahl der Punkte in y auf <= max_points durch gleichmäßiges Sampling.
+    y: 1D-iterable (pandas Series or numpy array)
+    returns: numpy array (downsampled)
+    """
+    import numpy as _np
+    if y is None:
+        return None
+    n = len(y)
+    if n <= max_points:
+        # return dense as numpy for faster matplotlib drawing
+        return _np.asarray(y)
+    idx = _np.linspace(0, n-1, num=max_points, dtype=int)
+    return _np.asarray(y).take(idx)
+
+
 # ---------------- Matplotlib renderer: single-session timeline (für Export wenn Kaleido aus) ----------------
 def render_single_session_timeline_matplotlib(csv_path: str, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)", outpath="timeline.png"):
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
-        # create empty image with message
-        fig, ax = plt.subplots(figsize=(10,4), dpi=110)
+        fig, ax = plt.subplots(figsize=(8,3), dpi=90)
         ax.text(0.5, 0.5, "Keine Zeitreihendaten", ha="center", va="center")
         ax.axis("off")
         fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
         return outpath
+
+    # Lade Zeitlabels (falls vorhanden)
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
         df0 = None
-    # find time labels
+
     time_labels = None
     if df0 is not None:
         cand = [c for c in df0.columns if str(c).lower() in
@@ -375,16 +394,39 @@ def render_single_session_timeline_matplotlib(csv_path: str, fs=250.0, smooth_se
                 pass
     if time_labels is None:
         time_labels = [(pd.Timestamp("1970-01-01") + pd.to_timedelta(np.arange(len(rel))/fs, unit="s")).strftime("%H:%M:%S")]
+
+    # harmonisiere Länge
     n = min(len(rel), len(time_labels))
     rel = rel.iloc[:n].copy()
-    t_labels = time_labels[:n]
+    time_labels = time_labels[:n]
+
+    # Glättung (Samples)
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
     for c in ["delta","theta","alpha","beta","gamma"]:
         if c in rel.columns:
             rel[c] = roll_mean(rel[c], w)
     rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
-    fig, ax = plt.subplots(figsize=(14,4), dpi=110)
+
+    # Downsample für Export — max ~800 Punkte (du kannst kleiner setzen, z.B. 500)
+    MAX_POINTS = 800
+    x_idx = np.arange(n)
+    # prepare decimated x-labels and position ticks at readable locations
+    dec_x = None
+    if n > MAX_POINTS:
+        # evenly spaced indices
+        idxs = np.linspace(0, n-1, num=MAX_POINTS, dtype=int)
+        dec_x = idxs
+        tick_step = max(1, int(MAX_POINTS / 8))
+        tick_positions = idxs[::tick_step]
+        tick_labels = [time_labels[i] for i in tick_positions]
+    else:
+        dec_x = x_idx
+        tick_positions = x_idx[::max(1, int(n/8))] if n>8 else x_idx
+        tick_labels = [time_labels[i] for i in tick_positions]
+
+    # Plot mit kleinerer Figure/DPI für Performance
+    fig, ax = plt.subplots(figsize=(12, 3.6), dpi=90)
     series = [
         ("Delta", rel.get("delta")), ("Theta", rel.get("theta")), ("Alpha", rel.get("alpha")),
         ("Beta", rel.get("beta")), ("Gamma", rel.get("gamma")),
@@ -392,24 +434,30 @@ def render_single_session_timeline_matplotlib(csv_path: str, fs=250.0, smooth_se
     ]
     colors = {"Delta":(0.39,0.58,0.93),"Theta":(0.28,0.24,0.55),"Alpha":(0.13,0.55,0.13),
               "Beta":(1.00,0.65,0.00),"Gamma":(0.86,0.08,0.24),"Stress-Welle":(0.8,0.4,0.2),"Relax-Welle":(0.2,0.7,0.6)}
-    x = np.arange(len(rel))
+
     for name, y in series:
         if y is not None:
-            ax.plot(x, y, lw=2.2, label=name, color=colors.get(name,(0.2,0.2,0.2)))
-    ax.set_xticks(x)
-    ax.set_xticklabels(t_labels, rotation=45, ha="right")
+            y_arr = np.asarray(y)
+            y_dec = decimate_series(y_arr, max_points=MAX_POINTS)
+            # plot decimated line; x for plotting must be 0..len(y_dec)-1
+            ax.plot(np.linspace(0, len(y_dec)-1, num=len(y_dec)), y_dec, lw=1.8, label=name, color=colors.get(name,(0.2,0.2,0.2)))
+
+    # set xticks based on decimated positions
+    ax.set_xticks(np.linspace(0, len(dec_x)-1, num=len(tick_positions), dtype=int))
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
     if y_mode == "0–1 (fix)":
         ax.set_ylim(0,1)
     ax.set_ylabel("Relativer Anteil")
-    ax.legend(ncol=4, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.25))
+    ax.legend(ncol=4, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.22))
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
+
 
 # ---------------- Matplotlib renderer: combined timeline + bar (for export fallback) ----------------
 def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Series,
                                                       fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)",
                                                       outpath="single_combo.png"):
-    # first prepare bar values
+    # Bar values (keine Änderung)
     vals = {
         "Stress": float(row["stress"]),
         "Entspannung": float(row["relax"]),
@@ -419,17 +467,17 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
         "Beta": float(row["beta"]),
         "Gamma": float(row["gamma"]),
     }
-    # prepare time series
+
     rel = load_session_relatives(csv_path) if csv_path else None
     if rel is None or rel.empty:
-        # only bar
-        figm, axm = plt.subplots(figsize=(10,6), dpi=110)
+        figm, axm = plt.subplots(figsize=(10,5), dpi=90)
         labels, v = list(vals.keys()), list(vals.values())
         bars = axm.bar(labels, v)
         for b, h in zip(bars, v):
             axm.text(b.get_x()+b.get_width()/2, h, f"{h:.2f}", ha="center", va="bottom")
         figm.tight_layout(); figm.savefig(outpath, bbox_inches="tight"); plt.close(figm)
         return outpath
+
     # time labels
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
@@ -449,43 +497,65 @@ def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Ser
                 pass
     if time_labels is None:
         time_labels = [(pd.Timestamp("1970-01-01") + pd.to_timedelta(np.arange(len(rel))/fs, unit="s")).strftime("%H:%M:%S")]
+
     n = min(len(rel), len(time_labels))
     rel = rel.iloc[:n].copy()
-    t = np.arange(n)
+    t_labels = time_labels[:n]
+
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
     for c in ["delta","theta","alpha","beta","gamma"]:
         if c in rel.columns:
             rel[c] = roll_mean(rel[c], w)
     rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
-    # plot combined
-    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(14,10), dpi=110, gridspec_kw={"height_ratios":[1,2]})
-    # bar top
+
+    # Downsample timeline (same approach)
+    MAX_POINTS = 900
+    total_n = len(rel)
+    if total_n > MAX_POINTS:
+        idxs = np.linspace(0, total_n-1, num=MAX_POINTS, dtype=int)
+        t_labels_dec = [t_labels[i] for i in idxs]
+        rel_dec = rel.iloc[idxs].reset_index(drop=True)
+    else:
+        idxs = np.arange(total_n)
+        t_labels_dec = t_labels
+        rel_dec = rel.reset_index(drop=True)
+
+    # Figure a bit smaller/dpi lower for speed
+    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(12,9), dpi=90, gridspec_kw={"height_ratios":[1,2]})
+
+    # Bar (top)
     labels, v = list(vals.keys()), list(vals.values())
     bars = ax1.bar(labels, v)
     for b, y in zip(bars, v):
         ax1.text(b.get_x()+b.get_width()/2, y, f"{y:.2f}", ha="center", va="bottom")
     ax1.set_ylim(0, max(1.0, max(v)*1.15))
     ax1.set_title("Balkendiagramm (Einzel-Session)")
-    # timeline bottom
+
+    # Timeline bottom (plot downsampled series)
     series = [
-        ("Delta", rel.get("delta")), ("Theta", rel.get("theta")), ("Alpha", rel.get("alpha")),
-        ("Beta", rel.get("beta")), ("Gamma", rel.get("gamma")),
-        ("Stress-Welle", rel.get("stresswave")), ("Relax-Welle", rel.get("relaxwave"))
+        ("Delta", rel_dec.get("delta")), ("Theta", rel_dec.get("theta")), ("Alpha", rel_dec.get("alpha")),
+        ("Beta", rel_dec.get("beta")), ("Gamma", rel_dec.get("gamma")),
+        ("Stress-Welle", rel_dec.get("stresswave")), ("Relax-Welle", rel_dec.get("relaxwave"))
     ]
     colors = {"Delta":(0.39,0.58,0.93),"Theta":(0.28,0.24,0.55),"Alpha":(0.13,0.55,0.13),
               "Beta":(1.00,0.65,0.00),"Gamma":(0.86,0.08,0.24),"Stress-Welle":(0.8,0.4,0.2),"Relax-Welle":(0.2,0.7,0.6)}
+    x_plot = np.arange(len(rel_dec))
     for name, y in series:
         if y is not None:
-            ax2.plot(t, y, lw=2.2, label=name, color=colors.get(name,(0.2,0.2,0.2)))
-    ax2.set_xticks(t)
-    ax2.set_xticklabels(time_labels[:n], rotation=45, ha="right")
+            ax2.plot(x_plot, np.asarray(y), lw=1.8, label=name, color=colors.get(name,(0.2,0.2,0.2)))
+
+    ax2.set_xticks(np.linspace(0, len(x_plot)-1, num=min(10, len(x_plot)), dtype=int))
+    # choose approx 10 tick labels
+    tick_ix = np.linspace(0, len(t_labels_dec)-1, num=min(10, len(t_labels_dec)), dtype=int)
+    ax2.set_xticklabels([t_labels_dec[i] for i in tick_ix], rotation=45, ha="right")
     if y_mode == "0–1 (fix)":
         ax2.set_ylim(0,1)
     ax2.set_ylabel("Relativer Anteil")
-    ax2.legend(ncol=3, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.2))
+    ax2.legend(ncol=3, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.12))
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
+
 
 # ---------------- save helpers (PNG->JPG) ----------------
 def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color=(255,255,255)):
