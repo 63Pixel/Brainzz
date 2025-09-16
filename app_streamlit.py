@@ -2,7 +2,11 @@
 # -*- coding: utf-8 -*-
 # EEG-Auswertung – Upload, Auswertung, persistente Charts, JPG-Rendering (Matplotlib default)
 #
-# Komplett-Version: Downsampling für Anzeige + Export, Fancy-Renderer, Timeline zuerst, JPG-Export (80%).
+# Änderungen:
+# - Kaleido deaktiviert (HAS_KALEIDO = False)
+# - Timeline-Matplotlib-Renderer hinzugefügt (funktioniert wenn Kaleido aus ist)
+# - Export: Balken-Only entfernt; Optionen: Timeline oder Kombi (Timeline oben, Balken unten)
+# - Auf der Seite: Timeline zuerst, Balkendiagramm darunter
 
 import os
 import re
@@ -28,13 +32,14 @@ try:
 except Exception:
     HAS_SCIPY = False
 
-# Kaleido (deaktiviert per default; du bevorzugst Matplotlib)
+# optional: Plotly→Kaleido PNG (deaktiviert, du wolltest Matplotlib)
 try:
     import kaleido  # noqa: F401
     _HAS_KALEIDO = True
 except Exception:
     _HAS_KALEIDO = False
-HAS_KALEIDO = False  # erzwingen Matplotlib-Fallback (du hattest das gesetzt)
+# Force off to avoid memory/Chrome issues (you already set this earlier)
+HAS_KALEIDO = False
 
 # Pillow für PNG->JPG
 try:
@@ -47,8 +52,6 @@ except Exception:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patheffects as pe
-from matplotlib.colors import to_rgba
 
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
@@ -88,7 +91,6 @@ def bandpass_signal(x, fs=250.0, low=0.5, high=45.0, order=4):
     return filtfilt(b, a, x)
 
 def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
-    """Filter nur, wenn KEINE fertigen Bandspalten vorliegen."""
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -112,17 +114,14 @@ def preprocess_csv_if_raw(csv_path, out_tmp_dir, fs=250.0):
     return outp, True
 
 def load_session_relatives(csv_path, agg="power"):
-    """Lädt relative Bandanteile (Delta..Gamma) zeitaufgelöst."""
     try:
         df = pd.read_csv(csv_path, low_memory=False)
     except Exception:
         return None
-
     bands = ["Delta", "Theta", "Alpha", "Beta", "Gamma"]
     cols = {b: [c for c in df.columns if str(c).startswith(f"{b}_")] or ([b] if b in df.columns else []) for b in bands}
     if not all(cols[b] for b in bands):
         return None
-
     out = {}
     for b in bands:
         try:
@@ -134,7 +133,6 @@ def load_session_relatives(csv_path, agg="power"):
             out[b.lower()] = val.mean(axis=1)
         except Exception:
             return None
-
     rel = pd.DataFrame(out).replace([np.inf, -np.inf], np.nan).dropna().clip(lower=0)
     tot = rel.sum(axis=1).replace(0, np.nan)
     return rel.div(tot, axis=0).dropna()
@@ -180,34 +178,7 @@ def find_csv_by_basename(name: str, root_dir: str):
     paths = [p for p in glob.glob(os.path.join(root_dir, "**", name), recursive=True)]
     return paths[0] if paths else None
 
-# ---------------- Decimate-Helfer (Anzeige & Export) ----------------
-def decimate_series(y, max_points=800):
-    """Reduziert y auf <= max_points (gleichmäßig). Gibt numpy array zurück."""
-    if y is None:
-        return None
-    y_arr = np.asarray(y)
-    n = len(y_arr)
-    if n <= max_points or max_points <= 0:
-        return y_arr
-    idx = np.linspace(0, n-1, num=max_points, dtype=int)
-    return y_arr.take(idx)
-
-def decimate_xy(x, y, max_points=800):
-    """
-    Decimiere x und y synchron. x kann Datetime/str/numeric.
-    Rückgabe: (x_dec, y_dec)
-    """
-    if y is None:
-        return x, y
-    n = len(y)
-    if n <= max_points or max_points <= 0:
-        return np.asarray(x), np.asarray(y)
-    idx = np.linspace(0, n-1, num=max_points, dtype=int)
-    x_arr = np.asarray(x)
-    y_arr = np.asarray(y)
-    return x_arr.take(idx), y_arr.take(idx)
-
-# ---------------- Plot-Funktionen (Anzeige: Downsampled, performant) ----------------
+# ---------------- Plot-Funktionen (leicht performant) ----------------
 def plot_single_session_interactive(df):
     vals = {"Stress": df["stress"].iloc[0], "Entspannung": df["relax"].iloc[0],
             "Delta": df["delta"].iloc[0], "Theta": df["theta"].iloc[0],
@@ -224,6 +195,7 @@ def plot_stress_relax(df, smooth=1, max_points=800):
     d["stress_trend"] = roll_mean(d["stress"], smooth)
     d["relax_trend"]  = roll_mean(d["relax"],  smooth)
 
+    # decimate both series on the same x
     x = d["date_str"].values
     x_dec, stress_dec = decimate_xy(x, d["stress_trend"].values, max_points=max_points)
     _, relax_dec = decimate_xy(x, d["relax_trend"].values, max_points=max_points)
@@ -237,6 +209,7 @@ def plot_stress_relax(df, smooth=1, max_points=800):
     fig = px.line(long, x="date_str", y="Wert", color="Metrik", markers=False, height=360)
     fig.update_layout(xaxis=dict(type="category"))
     return fig
+
 
 def plot_bands(df, smooth=1, y_mode="0–1 (fix)", max_points=800):
     d = df.copy()
@@ -253,7 +226,7 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)", max_points=800):
         "relaxwave_trend": "rgb(60,200,180)"
     }
 
-    x = d["date_str"].values
+    x = d["date_str"]
     fig = go.Figure()
     name_map = {
         "delta_trend": "Delta", "theta_trend": "Theta", "alpha_trend": "Alpha", "beta_trend": "Beta",
@@ -268,8 +241,9 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)", max_points=800):
         y_trend = d[key].values
         y_std = d[f"{base}_std"].values if f"{base}_std" in d else np.zeros_like(y_trend)
 
-        x_dec, y_trend_dec = decimate_xy(x, y_trend, max_points=max_points)
-        _, y_std_dec = decimate_xy(x, y_std, max_points=max_points)
+        # decimate both trend and std using same indices
+        x_dec, y_trend_dec = decimate_xy(x.values, y_trend, max_points=max_points)
+        _, y_std_dec = decimate_xy(x.values, y_std, max_points=max_points)
 
         ci_up = (y_trend_dec + y_std_dec).tolist()
         ci_dn = (y_trend_dec - y_std_dec).tolist()[::-1]
@@ -303,7 +277,8 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)", max_points=800):
         fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
     return fig
 
-# ---------------- Einzel-Session Timeline (Anzeige, Plotly) ----------------
+
+# ---------------- Einzel-Session Timeline (Plotly) ----------------
 def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)", max_points=800):
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
@@ -372,13 +347,9 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
 
     fig = go.Figure()
     palette = {
-        "Delta": "rgb(100,149,237)",
-        "Theta": "rgb(128,0,128)",
-        "Alpha": "rgb(34,139,34)",
-        "Beta": "rgb(255,165,0)",
-        "Gamma": "rgb(220,20,60)",
-        "Stress-Welle (Beta+Gamma)": "rgb(220,120,60)",
-        "Entspannungs-Welle (Alpha+Theta)": "rgb(60,200,180)"
+        "Delta": "rgb(100,149,237)", "Theta": "rgb(128,0,128)", "Alpha": "rgb(34,139,34)",
+        "Beta": "rgb(255,165,0)", "Gamma": "rgb(220,20,60)",
+        "Stress-Welle (Beta+Gamma)": "rgb(220,120,60)", "Entspannungs-Welle (Alpha+Theta)": "rgb(60,200,180)"
     }
 
     for key, label in bands_map.items():
@@ -386,7 +357,7 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
             continue
         y = rel[key].values
         x_dec, y_dec = decimate_xy(x_vals.values, y, max_points=max_points)
-        # subtle shadow
+        # shadow
         fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", showlegend=False, hoverinfo="skip",
                                  line=dict(color="rgba(0,0,0,0.06)", width=8)))
         # main line
@@ -404,147 +375,49 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
         fig.update_yaxes(title="Relativer Anteil")
     return fig
 
-# ---------------- "Schönes" Multi-Session Plotly-Generator ----------------
-def make_beauty_figure(df, kind="stress_relax", smooth=1, max_points=800):
-    x = df["date_str"].values
-    fig = go.Figure()
 
-    if kind == "stress_relax":
-        d = df.copy()
-        d["stress_trend"] = roll_mean(d["stress"], smooth)
-        d["relax_trend"]  = roll_mean(d["relax"],  smooth)
-        d["stress_std"]   = roll_std(d["stress"], smooth).fillna(0)
-        d["relax_std"]    = roll_std(d["relax"],  smooth).fillna(0)
 
-        x_dec, stress_trend_dec = decimate_xy(x, d["stress_trend"].values, max_points=max_points)
-        _, relax_trend_dec = decimate_xy(x, d["relax_trend"].values, max_points=max_points)
-        # Use CI approximations decimated too
-        # Stress CI
-        fig.add_trace(go.Scatter(
-            x=list(x_dec) + list(x_dec[::-1]),
-            y=list((stress_trend_dec + decimate_series(d["stress_std"].values, max_points))) +
-              list((stress_trend_dec - decimate_series(d["stress_std"].values, max_points))[::-1]),
-            fill="toself", fillcolor="rgba(220,70,70,0.12)", line=dict(width=0), hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(x=x_dec, y=stress_trend_dec, mode="lines", showlegend=False, hoverinfo="skip",
-                                 line=dict(color="rgba(0,0,0,0.06)", width=8)))
-        fig.add_trace(go.Scatter(x=x_dec, y=stress_trend_dec, mode="lines", name="Stress (Trend)",
-                                 line=dict(color="rgb(220,70,70)", width=3.5)))
+def decimate_series(y, max_points=800):
+    """Reduziert y auf <= max_points (gleichmäßig). Gibt numpy array zurück."""
+    import numpy as _np
+    if y is None:
+        return None
+    y_arr = _np.asarray(y)
+    n = len(y_arr)
+    if n <= max_points or max_points <= 0:
+        return y_arr
+    idx = _np.linspace(0, n-1, num=max_points, dtype=int)
+    return y_arr.take(idx)
 
-        # Relax CI
-        fig.add_trace(go.Scatter(
-            x=list(x_dec) + list(x_dec[::-1]),
-            y=list((relax_trend_dec + decimate_series(d["relax_std"].values, max_points))) +
-              list((relax_trend_dec - decimate_series(d["relax_std"].values, max_points))[::-1]),
-            fill="toself", fillcolor="rgba(70,170,70,0.12)", line=dict(width=0), hoverinfo="skip", showlegend=False))
-        fig.add_trace(go.Scatter(x=x_dec, y=relax_trend_dec, mode="lines", showlegend=False, hoverinfo="skip",
-                                 line=dict(color="rgba(0,0,0,0.06)", width=8)))
-        fig.add_trace(go.Scatter(x=x_dec, y=relax_trend_dec, mode="lines", name="Entspannung (Trend)",
-                                 line=dict(color="rgb(70,170,70)", width=3.5)))
-
-        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
-                          xaxis=dict(type="category", tickangle=45, title="Datum"), yaxis=dict(title="Index"),
-                          title="Stress- und Entspannungs-Trend")
-        return fig
-
-    if kind == "bands":
-        d = df.copy()
-        for c in ["delta", "theta", "alpha", "beta", "gamma"]:
-            d[f"{c}_trend"] = roll_mean(d[c], smooth)
-            d[f"{c}_std"] = roll_std(d[c], smooth).fillna(0)
-
-        palette = {
-            "delta_trend": ("Delta", "rgb(100,149,237)"),
-            "theta_trend": ("Theta", "rgb(128,0,128)"),
-            "alpha_trend": ("Alpha", "rgb(34,139,34)"),
-            "beta_trend":  ("Beta",  "rgb(255,165,0)"),
-            "gamma_trend": ("Gamma", "rgb(220,20,60)")
-        }
-
-        for key, (label, color) in palette.items():
-            base = key.replace("_trend", "")
-            x_dec, y_dec = decimate_xy(x, d[key].values, max_points=max_points)
-            std_dec = decimate_series(d[f"{base}_std"].values, max_points=max_points)
-            ci_up = (y_dec + std_dec).tolist()
-            ci_dn = (y_dec - std_dec).tolist()[::-1]
-            fig.add_trace(go.Scatter(x=list(x_dec) + list(x_dec[::-1]), y=ci_up + ci_dn,
-                                     fill="toself", fillcolor="rgba(150,150,150,0.08)", line=dict(width=0),
-                                     hoverinfo="skip", showlegend=False))
-            fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", showlegend=False,
-                                     line=dict(color="rgba(0,0,0,0.06)", width=6), hoverinfo="skip"))
-            fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", name=label,
-                                     line=dict(color=color, width=3.2)))
-        fig.update_layout(height=640, margin=dict(l=40, r=20, t=60, b=60),
-                          xaxis=dict(type="category", tickangle=45, title="Datum"),
-                          yaxis=dict(title="Relativer Anteil", range=[0,1]),
-                          title="EEG-Bänder (Trendlinien)")
-        return fig
-
-    raise ValueError("Unknown kind")
-
-# ---------------- Matplotlib-Fallback-Renderer für Multi-Session (keine Marker) ----------------
-def render_png_matplotlib(df, kind="stress_relax", smooth=1, outpath="render.png"):
-    plt.style.use("seaborn-v0_8-darkgrid")
-    fig, ax = plt.subplots(figsize=(16, 9), dpi=110)
-    x = np.arange(len(df))
-    xticks = df["date_str"].tolist()
-
-    if kind == "stress_relax":
-        d = df.copy()
-        d["stress_trend"] = roll_mean(d["stress"], smooth)
-        d["relax_trend"]  = roll_mean(d["relax"],  smooth)
-        d["stress_std"]   = roll_std(d["stress"], smooth).fillna(0)
-        d["relax_std"]    = roll_std(d["relax"],  smooth).fillna(0)
-
-        ax.fill_between(x, d["stress_trend"]-d["stress_std"], d["stress_trend"]+d["stress_std"],
-                        alpha=0.20, color=(0.86, 0.27, 0.27))
-        ax.fill_between(x, d["relax_trend"]-d["relax_std"], d["relax_trend"]+d["relax_std"],
-                        alpha=0.20, color=(0.27, 0.67, 0.27))
-        ax.plot(x, d["stress_trend"], c=(0.86, 0.27, 0.27), lw=3.5, zorder=3, label="Stress (Trend)")
-        ax.plot(x, d["relax_trend"], c=(0.27, 0.67, 0.27), lw=3.5, zorder=3, label="Entspannung (Trend)")
-        ax.legend(loc="best"); ax.set_ylabel("Index"); ax.set_title("Stress- und Entspannungs-Trend")
-
-    elif kind == "bands":
-        d = df.copy()
-        for c in ["delta", "theta", "alpha", "beta", "gamma"]:
-            d[f"{c}_trend"] = roll_mean(d[c], smooth)
-            d[f"{c}_std"] = roll_std(d[c], smooth).fillna(0)
-        series = [
-            ("Delta", d["delta_trend"], d["delta_std"], (0.39, 0.58, 0.93)),
-            ("Theta", d["theta_trend"], d["theta_std"], (0.28, 0.24, 0.55)),
-            ("Alpha", d["alpha_trend"], d["alpha_std"], (0.13, 0.55, 0.13)),
-            ("Beta",  d["beta_trend"], d["beta_std"], (1.00, 0.65, 0.00)),
-            ("Gamma", d["gamma_trend"], d["gamma_std"], (0.86, 0.08, 0.24)),
-        ]
-        for label, y, std, col in series:
-            ax.fill_between(x, y-std, y+std, alpha=0.12, color=col)
-            ax.plot(x, y, lw=3, c=col, zorder=3, label=label)
-        ax.set_ylim(0, 1); ax.set_ylabel("Relativer Anteil")
-        ax.set_title("EEG-Bänder (Trendlinien)"); ax.legend(loc="best")
-
-    ax.set_xticks(x); ax.set_xticklabels(xticks, rotation=45, ha="right")
-    fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
-    return outpath
-
-# ---------------- Matplotlib Fancy Renderer: Timeline (Fancy) ----------------
-def render_single_session_timeline_matplotlib_fancy(csv_path: str,
-                                                    fs=250.0,
-                                                    smooth_seconds=3,
-                                                    y_mode="0–1 (fix)",
-                                                    outpath="timeline_fancy.png",
-                                                    max_points=700):
+def decimate_xy(x, y, max_points=800):
     """
-    Fancy timeline: background gradient, soft shadows behind lines, CI with subtle gradient.
-    Downsampling via max_points.
+    Decimiere x und y synchron. x kann Datetime/str/numeric.
+    Rückgabe: (x_dec, y_dec) als numpy arrays / object array für x (z.B. datetimes).
     """
+    import numpy as _np
+    if y is None:
+        return x, y
+    n = len(y)
+    if n <= max_points or max_points <= 0:
+        return _np.asarray(x), _np.asarray(y)
+    idx = _np.linspace(0, n-1, num=max_points, dtype=int)
+    x_arr = _np.asarray(x)
+    y_arr = _np.asarray(y)
+    return x_arr.take(idx), y_arr.take(idx)
+
+
+
+# ---------------- Matplotlib renderer: single-session timeline (für Export wenn Kaleido aus) ----------------
+def render_single_session_timeline_matplotlib(csv_path: str, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)", outpath="timeline.png"):
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
-        fig, ax = plt.subplots(figsize=(10,4), dpi=90)
+        fig, ax = plt.subplots(figsize=(8,3), dpi=90)
         ax.text(0.5, 0.5, "Keine Zeitreihendaten", ha="center", va="center")
         ax.axis("off")
         fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
         return outpath
 
-    # Zeitlabels versuchen zu laden
+    # Lade Zeitlabels (falls vorhanden)
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -553,8 +426,7 @@ def render_single_session_timeline_matplotlib_fancy(csv_path: str,
     time_labels = None
     if df0 is not None:
         cand = [c for c in df0.columns if str(c).lower() in
-                ["timestamp", "time", "timesec", "t", "elapsed", "seconds", "secs",
-                 "ms", "millis", "datetime", "date_time", "date", "zeit", "uhrzeit", "clock"]]
+                ["timestamp", "time", "timesec", "t", "elapsed", "seconds", "secs", "ms", "millis", "datetime", "date_time", "date", "zeit", "uhrzeit", "clock"]]
         for c in cand:
             try:
                 td = pd.to_datetime(df0[c], errors="coerce")
@@ -566,12 +438,12 @@ def render_single_session_timeline_matplotlib_fancy(csv_path: str,
     if time_labels is None:
         time_labels = [(pd.Timestamp("1970-01-01") + pd.to_timedelta(np.arange(len(rel))/fs, unit="s")).strftime("%H:%M:%S")]
 
-    # Länge angleichen
+    # harmonisiere Länge
     n = min(len(rel), len(time_labels))
     rel = rel.iloc[:n].copy()
-    t_labels = time_labels[:n]
+    time_labels = time_labels[:n]
 
-    # Glätten
+    # Glättung (Samples)
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
     for c in ["delta","theta","alpha","beta","gamma"]:
         if c in rel.columns:
@@ -579,14 +451,25 @@ def render_single_session_timeline_matplotlib_fancy(csv_path: str,
     rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
 
-    # kleiner Decimate-Helfer (lokal)
-    def decim(arr, m=max_points):
-        arr = np.asarray(arr)
-        if len(arr) <= m: return arr
-        idx = np.linspace(0, len(arr)-1, num=m, dtype=int)
-        return arr[idx]
+    # Downsample für Export — max ~800 Punkte (du kannst kleiner setzen, z.B. 500)
+    MAX_POINTS = 800
+    x_idx = np.arange(n)
+    # prepare decimated x-labels and position ticks at readable locations
+    dec_x = None
+    if n > MAX_POINTS:
+        # evenly spaced indices
+        idxs = np.linspace(0, n-1, num=MAX_POINTS, dtype=int)
+        dec_x = idxs
+        tick_step = max(1, int(MAX_POINTS / 8))
+        tick_positions = idxs[::tick_step]
+        tick_labels = [time_labels[i] for i in tick_positions]
+    else:
+        dec_x = x_idx
+        tick_positions = x_idx[::max(1, int(n/8))] if n>8 else x_idx
+        tick_labels = [time_labels[i] for i in tick_positions]
 
-    # Serien & Farben
+    # Plot mit kleinerer Figure/DPI für Performance
+    fig, ax = plt.subplots(figsize=(12, 3.6), dpi=90)
     series = [
         ("Delta", rel.get("delta")), ("Theta", rel.get("theta")), ("Alpha", rel.get("alpha")),
         ("Beta", rel.get("beta")), ("Gamma", rel.get("gamma")),
@@ -595,77 +478,29 @@ def render_single_session_timeline_matplotlib_fancy(csv_path: str,
     colors = {"Delta":(0.39,0.58,0.93),"Theta":(0.28,0.24,0.55),"Alpha":(0.13,0.55,0.13),
               "Beta":(1.00,0.65,0.00),"Gamma":(0.86,0.08,0.24),"Stress-Welle":(0.8,0.4,0.2),"Relax-Welle":(0.2,0.7,0.6)}
 
-    fig, ax = plt.subplots(figsize=(13,3.6), dpi=100)
-
-    # very subtle background vertical gradient for depth
-    grad = np.linspace(0.0, 1.0, 256).reshape(1, -1)
-    ax.imshow(grad, aspect='auto', cmap=plt.get_cmap('Greys'),
-              extent=[0, max(1, n-1), 0, 1], alpha=0.03, zorder=0)
-
-    # draw series: layered shadow + main line + subtle glow + CI-like soft fills
-    last_y_dec_len = 1
     for name, y in series:
-        if y is None:
-            continue
-        y_arr = np.asarray(y)
-        y_dec = decim(y_arr, m=max_points)
-        x_dec = np.linspace(0, len(y_dec)-1, num=len(y_dec))
-        last_y_dec_len = len(y_dec)
+        if y is not None:
+            y_arr = np.asarray(y)
+            y_dec = decimate_series(y_arr, max_points=MAX_POINTS)
+            # plot decimated line; x for plotting must be 0..len(y_dec)-1
+            ax.plot(np.linspace(0, len(y_dec)-1, num=len(y_dec)), y_dec, lw=1.8, label=name, color=colors.get(name,(0.2,0.2,0.2)))
 
-        # broad faint shadow (two passes for softness)
-        ax.plot(x_dec, y_dec, lw=10, color=(0,0,0,0.055), solid_capstyle='round', zorder=1)
-        ax.plot(x_dec, y_dec, lw=6, color=(0,0,0,0.035), solid_capstyle='round', zorder=1)
-
-        # main colored line
-        col = colors.get(name, (0.2,0.2,0.2))
-        ln, = ax.plot(x_dec, y_dec, lw=2.6, color=col, zorder=3, solid_capstyle='round', solid_joinstyle='round')
-
-        # subtle outline/stroke to increase contrast
-        ln.set_path_effects([pe.Stroke(linewidth=4, foreground=(0,0,0,0.04)), pe.Normal()])
-
-        # soft CI-ish fill for band series (visual only)
-        if name in ["Delta","Theta","Alpha","Beta","Gamma"]:
-            std_approx = max(np.nanstd(y_dec), 0.015)
-            for i, a in enumerate([0.12, 0.07, 0.03]):
-                ax.fill_between(x_dec, y_dec - std_approx*(1+i*0.6), y_dec + std_approx*(1+i*0.6),
-                                color=to_rgba(col, a), zorder=0)
-
-    # xticks: pick up to 8 nicely spaced labels
-    tick_n = min(8, len(t_labels))
-    if tick_n > 1:
-        ix = np.linspace(0, n-1, num=tick_n, dtype=int)
-        tick_labels = [t_labels[i] for i in ix]
-        ax.set_xticks(np.linspace(0, last_y_dec_len-1, num=tick_n))
-        ax.set_xticklabels(tick_labels, rotation=45, ha='right')
-    else:
-        ax.set_xticks([])
-
+    # set xticks based on decimated positions
+    ax.set_xticks(np.linspace(0, len(dec_x)-1, num=len(tick_positions), dtype=int))
+    ax.set_xticklabels(tick_labels, rotation=45, ha="right")
     if y_mode == "0–1 (fix)":
         ax.set_ylim(0,1)
     ax.set_ylabel("Relativer Anteil")
-
-    # subtle frame
-    for spine in ax.spines.values():
-        spine.set_linewidth(0.6)
-        spine.set_alpha(0.6)
-
-    ax.grid(True, linewidth=0.35, alpha=0.25)
-    # legend with available series
-    labels = [s[0] for s in series if s[1] is not None]
-    ax.legend(labels, ncol=4, fontsize='small', loc='upper center', bbox_to_anchor=(0.5,1.18))
-    fig.tight_layout()
-    fig.savefig(outpath, bbox_inches='tight', dpi=100)
-    plt.close(fig)
+    ax.legend(ncol=4, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.22))
+    fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
 
-# ---------------- Matplotlib Fancy Renderer: Combo (Timeline fancy + Bar) ----------------
-def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: pd.Series,
-                                                           fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)",
-                                                           outpath="single_combo_fancy.png", max_points=700):
-    """
-    Fancy combo: oben Timeline (fancy), unten Balken. Downsampling wie oben.
-    """
-    # Bar-Werte
+
+# ---------------- Matplotlib renderer: combined timeline + bar (for export fallback) ----------------
+def render_single_session_bar_and_timeline_matplotlib(csv_path: str, row: pd.Series,
+                                                      fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)",
+                                                      outpath="single_combo.png"):
+    # Bar values (keine Änderung)
     vals = {
         "Stress": float(row["stress"]),
         "Entspannung": float(row["relax"]),
@@ -678,16 +513,15 @@ def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: 
 
     rel = load_session_relatives(csv_path) if csv_path else None
     if rel is None or rel.empty:
-        # nur Balken (Fallback)
-        figm, axm = plt.subplots(figsize=(10,6), dpi=90)
+        figm, axm = plt.subplots(figsize=(10,5), dpi=90)
         labels, v = list(vals.keys()), list(vals.values())
-        bars = axm.bar(labels, v, edgecolor='none')
+        bars = axm.bar(labels, v)
         for b, h in zip(bars, v):
             axm.text(b.get_x()+b.get_width()/2, h, f"{h:.2f}", ha="center", va="bottom")
         figm.tight_layout(); figm.savefig(outpath, bbox_inches="tight"); plt.close(figm)
         return outpath
 
-    # Zeitlabels wie in fancy timeline
+    # time labels
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
@@ -695,8 +529,7 @@ def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: 
     time_labels = None
     if df0 is not None:
         cand = [c for c in df0.columns if str(c).lower() in
-                ["timestamp", "time", "timesec", "t", "elapsed", "seconds", "secs",
-                 "ms", "millis", "datetime", "date_time", "date", "zeit", "uhrzeit", "clock"]]
+                ["timestamp","time","datetime","date_time","date","uhrzeit","zeit","clock"]]
         for c in cand:
             try:
                 td = pd.to_datetime(df0[c], errors="coerce")
@@ -712,7 +545,6 @@ def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: 
     rel = rel.iloc[:n].copy()
     t_labels = time_labels[:n]
 
-    # Glättung
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
     for c in ["delta","theta","alpha","beta","gamma"]:
         if c in rel.columns:
@@ -721,7 +553,7 @@ def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: 
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
 
     # Downsample timeline (same approach)
-    MAX_POINTS = max(200, min(len(rel), max_points))
+    MAX_POINTS = 900
     total_n = len(rel)
     if total_n > MAX_POINTS:
         idxs = np.linspace(0, total_n-1, num=MAX_POINTS, dtype=int)
@@ -732,18 +564,18 @@ def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: 
         t_labels_dec = t_labels
         rel_dec = rel.reset_index(drop=True)
 
-    # Figure
-    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(13,10), dpi=100, gridspec_kw={"height_ratios":[1,2]})
+    # Figure a bit smaller/dpi lower for speed
+    fig, (ax1, ax2) = plt.subplots(2,1, figsize=(12,9), dpi=90, gridspec_kw={"height_ratios":[1,2]})
 
-    # top: bar (compact, but styled)
+    # Bar (top)
     labels, v = list(vals.keys()), list(vals.values())
-    bars = ax1.bar(labels, v, color=[(0.85,0.85,0.85)] + [(0.6,0.85,0.6)] + [(0.7,0.7,0.9)]*5)
-    for b, h in zip(bars, v):
-        ax1.text(b.get_x()+b.get_width()/2, h, f"{h:.2f}", ha="center", va="bottom")
+    bars = ax1.bar(labels, v)
+    for b, y in zip(bars, v):
+        ax1.text(b.get_x()+b.get_width()/2, y, f"{y:.2f}", ha="center", va="bottom")
     ax1.set_ylim(0, max(1.0, max(v)*1.15))
     ax1.set_title("Balkendiagramm (Einzel-Session)")
 
-    # bottom: fancy timeline (use rel_dec)
+    # Timeline bottom (plot downsampled series)
     series = [
         ("Delta", rel_dec.get("delta")), ("Theta", rel_dec.get("theta")), ("Alpha", rel_dec.get("alpha")),
         ("Beta", rel_dec.get("beta")), ("Gamma", rel_dec.get("gamma")),
@@ -752,26 +584,23 @@ def render_single_session_bar_and_timeline_matplotlib_fancy(csv_path: str, row: 
     colors = {"Delta":(0.39,0.58,0.93),"Theta":(0.28,0.24,0.55),"Alpha":(0.13,0.55,0.13),
               "Beta":(1.00,0.65,0.00),"Gamma":(0.86,0.08,0.24),"Stress-Welle":(0.8,0.4,0.2),"Relax-Welle":(0.2,0.7,0.6)}
     x_plot = np.arange(len(rel_dec))
-
-    last_len = len(x_plot)
     for name, y in series:
         if y is not None:
-            y_arr = np.asarray(y)
-            ax2.plot(x_plot, y_arr, lw=2.2, label=name, color=colors.get(name,(0.2,0.2,0.2)))
-    # xticks: pick approx 10 labels
-    tick_n = min(10, len(t_labels_dec))
-    if tick_n > 1:
-        ix = np.linspace(0, len(t_labels_dec)-1, num=tick_n, dtype=int)
-        ax2.set_xticks(np.linspace(0, last_len-1, num=tick_n))
-        ax2.set_xticklabels([t_labels_dec[i] for i in ix], rotation=45, ha="right")
+            ax2.plot(x_plot, np.asarray(y), lw=1.8, label=name, color=colors.get(name,(0.2,0.2,0.2)))
+
+    ax2.set_xticks(np.linspace(0, len(x_plot)-1, num=min(10, len(x_plot)), dtype=int))
+    # choose approx 10 tick labels
+    tick_ix = np.linspace(0, len(t_labels_dec)-1, num=min(10, len(t_labels_dec)), dtype=int)
+    ax2.set_xticklabels([t_labels_dec[i] for i in tick_ix], rotation=45, ha="right")
     if y_mode == "0–1 (fix)":
         ax2.set_ylim(0,1)
     ax2.set_ylabel("Relativer Anteil")
-    ax2.legend(ncol=3, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.08))
+    ax2.legend(ncol=3, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.12))
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
     return outpath
 
-# ---------------- PNG->JPG Konvertierung ----------------
+
+# ---------------- save helpers (PNG->JPG) ----------------
 def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color=(255,255,255)):
     if not HAS_PIL:
         raise RuntimeError("Pillow nicht installiert")
@@ -785,12 +614,24 @@ def convert_png_to_jpg(png_path: str, jpg_path: str, quality: int = 80, bg_color
         im.save(jpg_path, "JPEG", quality=int(np.clip(quality, 10, 100)))
     return jpg_path
 
+def save_matplotlib_then_jpg(make_png_func, out_base: str, jpg_quality=80, **kwargs):
+    out_png = f"{out_base}.png"
+    make_png_func(outpath=out_png, **kwargs)
+    out_jpg = f"{out_base}.jpg"
+    try:
+        convert_png_to_jpg(out_png, out_jpg, quality=jpg_quality)
+        try:
+            os.remove(out_png)
+        except Exception:
+            pass
+        return out_jpg
+    except Exception:
+        return out_png
+
 def save_plotly_as_jpg(fig: go.Figure, out_base: str, width=1600, height=1200, scale=3, jpg_quality=80):
-    """Plotly -> tmp PNG -> JPG (Pillow)."""
     tmp_png = f"{out_base}__tmp.png"
     out_jpg = f"{out_base}.jpg"
     try:
-        # pio.write_image will use kaleido if available
         pio.write_image(fig, tmp_png, width=width, height=height, scale=scale)
         if not HAS_PIL:
             raise RuntimeError("Pillow nicht installiert")
@@ -808,22 +649,7 @@ def save_plotly_as_jpg(fig: go.Figure, out_base: str, width=1600, height=1200, s
             pass
         raise
 
-def save_matplotlib_then_jpg(make_png_func, out_base: str, jpg_quality=80, **kwargs):
-    out_png = f"{out_base}.png"
-    # make_png_func may accept outpath kw or outpath positional; we'll call via kwargs
-    make_png_func(**{**kwargs, "outpath": out_png})
-    out_jpg = f"{out_base}.jpg"
-    try:
-        convert_png_to_jpg(out_png, out_jpg, quality=jpg_quality)
-        try:
-            os.remove(out_png)
-        except Exception:
-            pass
-        return out_jpg
-    except Exception:
-        return out_png
-
-# ---------------- Chart-Baukasten ----------------
+# ---------------- Chart building ----------------
 def build_charts(df: pd.DataFrame, smooth: int, y_mode: str, max_points: int = 800):
     charts = {}
     if len(df) == 1:
@@ -833,7 +659,7 @@ def build_charts(df: pd.DataFrame, smooth: int, y_mode: str, max_points: int = 8
         charts["bands"]  = plot_bands(df, smooth=smooth, y_mode=y_mode, max_points=max_points)
     return charts
 
-# ---------------- UI: Upload & Params ----------------
+# ---------------- UI ----------------
 st.subheader("1) Datei-Upload")
 uploads = st.file_uploader(
     "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
@@ -869,25 +695,16 @@ y_mode = st.selectbox("Y-Achse für Bänder", ["0–1 (fix)", "Auto (zoom)", "Ab
 fs = st.number_input("Sampling-Rate für Preprocessing/Timeline (Hz)", value=250.0, step=1.0)
 do_preproc = st.checkbox("Preprocessing (Notch+Bandpass), falls Rohdaten", value=(True and HAS_SCIPY))
 
-# Anzeige-Downsample (für interaktive Darstellung)
-display_max = st.slider("Max Punkte (Anzeige)", 200, 3000, 800, step=50,
-                        help="Wieviele Punkte maximal in interaktiven Plots angezeigt werden (Downsample für Performance).")
-
-# Render-Style für Export/Vorschau
-render_style = st.selectbox("Render-Style (Export/Vorschau)", ["plain", "fancy", "compact"], index=1,
-                            help="plain = schnell, fancy = plastisch mit Schatten/Gradient, compact = platzsparend")
-
 csv_paths_all = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
 n_csv = len(csv_paths_all)
 total_mb = sum(os.path.getsize(p) for p in csv_paths_all) / (1024*1024) if n_csv > 0 else 0.0
 st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
 
 if "df_summary" in st.session_state and not st.session_state["df_summary"].empty:
-    if st.session_state.get("last_smooth") != smooth or st.session_state.get("last_y_mode") != y_mode or st.session_state.get("last_display_max") != display_max:
-        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, y_mode, max_points=display_max)
+    if st.session_state.get("last_smooth") != smooth or st.session_state.get("last_y_mode") != y_mode:
+        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, y_mode)
         st.session_state["last_smooth"] = smooth
         st.session_state["last_y_mode"]  = y_mode
-        st.session_state["last_display_max"] = display_max
 
 # ---------------- Auswertung ----------------
 if st.button("Auswertung starten"):
@@ -926,7 +743,6 @@ if st.button("Auswertung starten"):
             shutil.rmtree(tmpdir)
         except Exception:
             pass
-
         df = pd.DataFrame(rows)
         if df.empty:
             st.error("Keine gültigen Sessions.")
@@ -936,8 +752,7 @@ if st.button("Auswertung starten"):
             st.session_state["df_summary"] = df.copy()
             st.session_state["last_smooth"] = smooth
             st.session_state["last_y_mode"]  = y_mode
-            st.session_state["last_display_max"] = display_max
-            st.session_state["charts"] = build_charts(df, smooth, y_mode, max_points=display_max)
+            st.session_state["charts"] = build_charts(df, smooth, y_mode)
             st.success(f"{len(df)} Session(s) ausgewertet. Anzeige unten aktualisiert.")
         if failed:
             st.subheader("Übersprungene Dateien")
@@ -958,7 +773,7 @@ if not df_show.empty:
         csv_name = df_show.iloc[0]["source"]
         csv_path = find_csv_by_basename(csv_name, workdir)
         if csv_path:
-            fig_ts = plot_single_session_timeline(csv_path, fs=fs, smooth_seconds=ss_smooth, y_mode=y_mode_single, max_points=display_max)
+            fig_ts = plot_single_session_timeline(csv_path, fs=fs, smooth_seconds=ss_smooth, y_mode=y_mode_single)
             st.plotly_chart(fig_ts, use_container_width=True)
         else:
             st.info("Original-CSV für die Einzel-Session wurde nicht gefunden.")
@@ -969,23 +784,20 @@ if not df_show.empty:
         st.dataframe(df_show.round(4))
     else:
         st.subheader("Stress/Entspannung")
-        fig1 = charts.get("stress") or plot_stress_relax(df_show, smooth=smooth, max_points=display_max)
+        fig1 = charts.get("stress") or plot_stress_relax(df_show, smooth=smooth)
         st.plotly_chart(fig1, use_container_width=True)
-
         st.subheader("Bänder + Wellen")
-        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth, y_mode=y_mode, max_points=display_max)
+        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth, y_mode=y_mode)
         st.plotly_chart(fig2, use_container_width=True)
-
         st.subheader("Tabelle")
         st.dataframe(df_show.round(4))
-
     df_out = df_show.copy()
     df_out["date_str"] = df_out["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
     st.download_button("Summary CSV herunterladen",
                        data=df_out.to_csv(index=False).encode("utf-8"),
                        file_name="summary_indices.csv", mime="text/csv")
 
-# ---------------- Export (JPG) - Timeline or Both (Kombi) ----------------
+# ---------------- Export (JPG) - Timeline or Both ----------------
 st.subheader("Export (JPG, Qualität 80%)")
 if df_show.empty:
     st.info("Keine Auswertung im Speicher. Erst „Auswertung starten“.")
@@ -1004,57 +816,30 @@ else:
                 if export_choice == "Timeline (Zeitverlauf)":
                     if not session_csv_path:
                         raise RuntimeError("Original-CSV für Timeline nicht gefunden.")
-                    # choose renderer based on render_style
-                    if render_style == "fancy":
-                        out_jpg = save_matplotlib_then_jpg(
-                            make_png_func=render_single_session_timeline_matplotlib_fancy,
-                            out_base=basepath + "_timeline_fancy",
-                            jpg_quality=80,
-                            csv_path=session_csv_path,
-                            fs=fs,
-                            smooth_seconds=ss_smooth,
-                            y_mode=y_mode_single,
-                            max_points=max(200, min(2000, display_max))
-                        )
-                    else:
-                        out_jpg = save_matplotlib_then_jpg(
-                            make_png_func=render_single_session_timeline_matplotlib,
-                            out_base=basepath + "_timeline",
-                            jpg_quality=80,
-                            csv_path=session_csv_path,
-                            fs=fs,
-                            smooth_seconds=ss_smooth,
-                            y_mode=y_mode_single,
-                            outpath=basepath + "_timeline.png"  # compatibility
-                        )
+                    # if Kaleido available (but we forced it off) we'd use Plotly; else Matplotlib timeline renderer
+                    out_jpg = save_matplotlib_then_jpg(
+                        make_png_func=render_single_session_timeline_matplotlib,
+                        out_base=basepath + "_timeline",
+                        jpg_quality=80,
+                        csv_path=session_csv_path,
+                        fs=fs,
+                        smooth_seconds=ss_smooth,
+                        y_mode=y_mode_single
+                    )
                 else:
-                    # Both: timeline above, bar below
+                    # Both: timeline above, bar below using Matplotlib combined renderer
                     if not session_csv_path:
                         raise RuntimeError("Original-CSV für Timeline nicht gefunden.")
-                    if render_style == "fancy":
-                        out_jpg = save_matplotlib_then_jpg(
-                            make_png_func=render_single_session_bar_and_timeline_matplotlib_fancy,
-                            out_base=basepath + "_combo_fancy",
-                            jpg_quality=80,
-                            csv_path=session_csv_path,
-                            row=df_show.iloc[0],
-                            fs=fs,
-                            smooth_seconds=ss_smooth,
-                            y_mode=y_mode_single,
-                            max_points=max(200, min(2000, display_max))
-                        )
-                    else:
-                        out_jpg = save_matplotlib_then_jpg(
-                            make_png_func=render_single_session_bar_and_timeline_matplotlib,
-                            out_base=basepath + "_combo",
-                            jpg_quality=80,
-                            csv_path=session_csv_path,
-                            row=df_show.iloc[0],
-                            fs=fs,
-                            smooth_seconds=ss_smooth,
-                            y_mode=y_mode_single,
-                            outpath=basepath + "_combo.png"
-                        )
+                    out_jpg = save_matplotlib_then_jpg(
+                        make_png_func=render_single_session_bar_and_timeline_matplotlib,
+                        out_base=basepath + "_combo",
+                        jpg_quality=80,
+                        csv_path=session_csv_path,
+                        row=df_show.iloc[0],
+                        fs=fs,
+                        smooth_seconds=ss_smooth,
+                        y_mode=y_mode_single
+                    )
                 st.session_state["render_path"] = out_jpg
                 st.success(f"JPG erzeugt: {out_jpg}")
             except Exception as e:
@@ -1097,6 +882,6 @@ with st.expander("Debug / Wartung", expanded=False):
             shutil.rmtree(st.session_state["workdir"])
         except Exception:
             pass
-        for k in ["workdir", "df_summary", "charts", "render_path", "last_smooth", "last_y_mode", "last_display_max"]:
+        for k in ["workdir", "df_summary", "charts", "render_path", "last_smooth", "last_y_mode"]:
             st.session_state.pop(k, None)
         st.success("Arbeitsordner geleert. Seite neu laden.")
