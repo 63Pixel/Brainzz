@@ -190,32 +190,42 @@ def plot_single_session_interactive(df):
     fig.update_layout(margin=dict(l=10, r=10, t=30, b=10))
     return fig
 
-def plot_stress_relax(df, smooth=1):
+def plot_stress_relax(df, smooth=1, max_points=800):
     d = df.copy()
     d["stress_trend"] = roll_mean(d["stress"], smooth)
     d["relax_trend"]  = roll_mean(d["relax"],  smooth)
-    long = d.melt(id_vars=["date_str"], value_vars=["stress_trend", "relax_trend"],
-                  var_name="Metrik", value_name="Wert")
+
+    # decimate both series on the same x
+    x = d["date_str"].values
+    x_dec, stress_dec = decimate_xy(x, d["stress_trend"].values, max_points=max_points)
+    _, relax_dec = decimate_xy(x, d["relax_trend"].values, max_points=max_points)
+
+    long = pd.DataFrame({
+        "date_str": list(x_dec) + list(x_dec),
+        "Metrik": ["Stress (Trend)"] * len(x_dec) + ["Entspannung (Trend)"] * len(x_dec),
+        "Wert": list(stress_dec) + list(relax_dec)
+    })
+
     fig = px.line(long, x="date_str", y="Wert", color="Metrik", markers=False, height=360)
     fig.update_layout(xaxis=dict(type="category"))
     return fig
 
-def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
+
+def plot_bands(df, smooth=1, y_mode="0–1 (fix)", max_points=800):
     d = df.copy()
     d["stresswave"] = d["beta"] + d["gamma"]
     d["relaxwave"]  = d["alpha"] + d["theta"]
     for c in ["delta", "theta", "alpha", "beta", "gamma", "stresswave", "relaxwave"]:
         d[f"{c}_trend"] = roll_mean(d[c], smooth)
         d[f"{c}_std"] = roll_std(d[c], smooth).fillna(0)
+
     palette = {
-        "delta_trend": "rgb(100,149,237)",
-        "theta_trend": "rgb(128,0,128)",
-        "alpha_trend": "rgb(34,139,34)",
-        "beta_trend":  "rgb(255,165,0)",
-        "gamma_trend": "rgb(220,20,60)",
-        "stresswave_trend": "rgb(220,120,60)",
+        "delta_trend": "rgb(100,149,237)", "theta_trend": "rgb(128,0,128)",
+        "alpha_trend": "rgb(34,139,34)", "beta_trend": "rgb(255,165,0)",
+        "gamma_trend": "rgb(220,20,60)", "stresswave_trend": "rgb(220,120,60)",
         "relaxwave_trend": "rgb(60,200,180)"
     }
+
     x = d["date_str"]
     fig = go.Figure()
     name_map = {
@@ -223,14 +233,23 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
         "gamma_trend": "Gamma", "stresswave_trend": "Stress-Welle (Beta+Gamma)",
         "relaxwave_trend": "Entspannungs-Welle (Alpha+Theta)"
     }
+
     for key, label in name_map.items():
         if key not in d:
             continue
         base = key.replace("_trend", "")
-        ci_up = (d[key] + d[f"{base}_std"]).tolist()
-        ci_dn = (d[key] - d[f"{base}_std"]).tolist()[::-1]
+        y_trend = d[key].values
+        y_std = d[f"{base}_std"].values if f"{base}_std" in d else np.zeros_like(y_trend)
+
+        # decimate both trend and std using same indices
+        x_dec, y_trend_dec = decimate_xy(x.values, y_trend, max_points=max_points)
+        _, y_std_dec = decimate_xy(x.values, y_std, max_points=max_points)
+
+        ci_up = (y_trend_dec + y_std_dec).tolist()
+        ci_dn = (y_trend_dec - y_std_dec).tolist()[::-1]
+
         fig.add_trace(go.Scatter(
-            x=list(x) + list(x[::-1]),
+            x=list(x_dec) + list(x_dec[::-1]),
             y=ci_up + ci_dn,
             fill="toself",
             fillcolor="rgba(150,150,150,0.08)",
@@ -239,14 +258,15 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
             showlegend=False
         ))
         fig.add_trace(go.Scatter(
-            x=x, y=d[key], mode="lines",
+            x=x_dec, y=y_trend_dec, mode="lines",
             line=dict(color="rgba(0,0,0,0.06)", width=6),
             hoverinfo="skip", showlegend=False
         ))
         fig.add_trace(go.Scatter(
-            x=x, y=d[key], mode="lines", name=label,
+            x=x_dec, y=y_trend_dec, mode="lines", name=label,
             line=dict(color=palette.get(key, "rgb(100,100,100)"), width=3.0)
         ))
+
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=40), xaxis=dict(type="category"), xaxis_title="Datum")
     if y_mode == "0–1 (fix)":
         fig.update_yaxes(range=[0, 1], title="Wert")
@@ -257,15 +277,18 @@ def plot_bands(df, smooth=1, y_mode="0–1 (fix)"):
         fig.add_hline(y=0, line_width=1, line_dash="dot", line_color="gray")
     return fig
 
+
 # ---------------- Einzel-Session Timeline (Plotly) ----------------
-def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)"):
+def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0–1 (fix)", max_points=800):
     rel = load_session_relatives(csv_path)
     if rel is None or rel.empty:
         return go.Figure()
+
     try:
         df0 = pd.read_csv(csv_path, low_memory=False)
     except Exception:
         df0 = None
+
     x_vals = None
     is_datetime = False
     if df0 is not None:
@@ -299,42 +322,48 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
                         break
                 except Exception:
                     pass
+
     if x_vals is None:
         secs = np.arange(len(rel)) / (fs if fs and fs > 0 else 1.0)
         x_vals = pd.to_datetime(secs, unit="s", origin=pd.Timestamp("1970-01-01"))
         is_datetime = True
+
     n = min(len(rel), len(x_vals))
     rel = rel.iloc[:n].copy()
     x_vals = pd.Series(x_vals).iloc[:n].reset_index(drop=True)
+
     w = max(1, int(round((smooth_seconds if smooth_seconds else 0) * (fs if fs else 1))))
     for c in ["delta", "theta", "alpha", "beta", "gamma"]:
         if c in rel.columns:
             rel[c] = roll_mean(rel[c], w)
     rel["stresswave"] = roll_mean(rel["beta"] + rel["gamma"], w)
     rel["relaxwave"]  = roll_mean(rel["alpha"] + rel["theta"], w)
+
     bands_map = {
         "delta": "Delta", "theta": "Theta", "alpha": "Alpha",
         "beta": "Beta", "gamma": "Gamma",
         "stresswave": "Stress-Welle (Beta+Gamma)", "relaxwave": "Entspannungs-Welle (Alpha+Theta)"
     }
+
     fig = go.Figure()
     palette = {
-        "Delta": "rgb(100,149,237)",
-        "Theta": "rgb(128,0,128)",
-        "Alpha": "rgb(34,139,34)",
-        "Beta": "rgb(255,165,0)",
-        "Gamma": "rgb(220,20,60)",
-        "Stress-Welle (Beta+Gamma)": "rgb(220,120,60)",
-        "Entspannungs-Welle (Alpha+Theta)": "rgb(60,200,180)"
+        "Delta": "rgb(100,149,237)", "Theta": "rgb(128,0,128)", "Alpha": "rgb(34,139,34)",
+        "Beta": "rgb(255,165,0)", "Gamma": "rgb(220,20,60)",
+        "Stress-Welle (Beta+Gamma)": "rgb(220,120,60)", "Entspannungs-Welle (Alpha+Theta)": "rgb(60,200,180)"
     }
+
     for key, label in bands_map.items():
         if key not in rel:
             continue
         y = rel[key].values
-        fig.add_trace(go.Scatter(x=x_vals, y=y, mode="lines", showlegend=False, hoverinfo="skip",
+        x_dec, y_dec = decimate_xy(x_vals.values, y, max_points=max_points)
+        # shadow
+        fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", showlegend=False, hoverinfo="skip",
                                  line=dict(color="rgba(0,0,0,0.06)", width=8)))
-        fig.add_trace(go.Scatter(x=x_vals, y=y, mode="lines", name=label,
+        # main line
+        fig.add_trace(go.Scatter(x=x_dec, y=y_dec, mode="lines", name=label,
                                  line=dict(color=palette.get(label, "gray"), width=2)))
+
     fig.update_layout(height=380, margin=dict(l=10, r=10, t=20, b=40))
     if is_datetime:
         fig.update_xaxes(title_text="Uhrzeit", tickformat="%H:%M:%S", tickangle=45)
@@ -347,21 +376,35 @@ def plot_single_session_timeline(csv_path, fs=250.0, smooth_seconds=3, y_mode="0
     return fig
 
 
+
 def decimate_series(y, max_points=800):
-    """
-    Reduziert die Anzahl der Punkte in y auf <= max_points durch gleichmäßiges Sampling.
-    y: 1D-iterable (pandas Series or numpy array)
-    returns: numpy array (downsampled)
-    """
+    """Reduziert y auf <= max_points (gleichmäßig). Gibt numpy array zurück."""
     import numpy as _np
     if y is None:
         return None
-    n = len(y)
-    if n <= max_points:
-        # return dense as numpy for faster matplotlib drawing
-        return _np.asarray(y)
+    y_arr = _np.asarray(y)
+    n = len(y_arr)
+    if n <= max_points or max_points <= 0:
+        return y_arr
     idx = _np.linspace(0, n-1, num=max_points, dtype=int)
-    return _np.asarray(y).take(idx)
+    return y_arr.take(idx)
+
+def decimate_xy(x, y, max_points=800):
+    """
+    Decimiere x und y synchron. x kann Datetime/str/numeric.
+    Rückgabe: (x_dec, y_dec) als numpy arrays / object array für x (z.B. datetimes).
+    """
+    import numpy as _np
+    if y is None:
+        return x, y
+    n = len(y)
+    if n <= max_points or max_points <= 0:
+        return _np.asarray(x), _np.asarray(y)
+    idx = _np.linspace(0, n-1, num=max_points, dtype=int)
+    x_arr = _np.asarray(x)
+    y_arr = _np.asarray(y)
+    return x_arr.take(idx), y_arr.take(idx)
+
 
 
 # ---------------- Matplotlib renderer: single-session timeline (für Export wenn Kaleido aus) ----------------
@@ -607,13 +650,13 @@ def save_plotly_as_jpg(fig: go.Figure, out_base: str, width=1600, height=1200, s
         raise
 
 # ---------------- Chart building ----------------
-def build_charts(df: pd.DataFrame, smooth: int, y_mode: str):
+def build_charts(df: pd.DataFrame, smooth: int, y_mode: str, max_points: int = 800):
     charts = {}
     if len(df) == 1:
         charts["single"] = plot_single_session_interactive(df)
     else:
-        charts["stress"] = plot_stress_relax(df, smooth=smooth)
-        charts["bands"]  = plot_bands(df, smooth=smooth, y_mode=y_mode)
+        charts["stress"] = plot_stress_relax(df, smooth=smooth, max_points=max_points)
+        charts["bands"]  = plot_bands(df, smooth=smooth, y_mode=y_mode, max_points=max_points)
     return charts
 
 # ---------------- UI ----------------
