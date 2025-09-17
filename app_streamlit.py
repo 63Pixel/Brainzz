@@ -55,42 +55,43 @@ def create_test_zip(num_sessions: int = 3, rows: int = 400, fs: int = 250):
     Jede innere ZIP hat eine CSV namens brainzz_..._session.csv.
     Rückgabe: bytes (äußere ZIP).
     """
-    buf_outer = io.BytesIO()
+    outer_buf = io.BytesIO()
     now = datetime.now()
 
-    for sess_idx in range(1, num_sessions+1):
-        # Erzeuge CSV für diese Session
-        ts = (now + timedelta(seconds=sess_idx)).strftime("%Y-%m-%d--%H-%M-%S")
-        csv_name = f"brainzz_{ts}_session.csv"
-        t = np.arange(rows) / fs
-        rng = np.random.RandomState(100 + sess_idx)
-        delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
-        theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
-        alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
-        beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
-        gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
-        tot = delta + theta + alpha + beta + gamma + 1e-12
-        delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
-        times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
-        df = pd.DataFrame({
-            "datetime": times,
-            "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
-            "Beta_1": beta, "Gamma_1": gamma
-        })
-        csv_bytes = df.to_csv(index=False).encode("utf-8")
+    # Erzeuge äußere ZIP
+    with zipfile.ZipFile(outer_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf_out:
+        for i in range(num_sessions):
+            # CSV-Inhalt erzeugen
+            ts = (now + timedelta(seconds=i)).strftime("%Y-%m-%d--%H-%M-%S")
+            csv_name = f"brainzz_{ts}_session.csv"
+            t = np.arange(rows) / fs
+            rng = np.random.RandomState(100 + i)
+            delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
+            theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
+            alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
+            beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
+            gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
+            tot = delta + theta + alpha + beta + gamma + 1e-12
+            delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
+            times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
+            df = pd.DataFrame({
+                "datetime": times,
+                "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
+                "Beta_1": beta, "Gamma_1": gamma
+            })
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
 
-        # Erzeuge eine innere ZIP mit genau dieser CSV
-        inner_buf = io.BytesIO()
-        with zipfile.ZipFile(inner_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf_in:
-            zf_in.writestr(csv_name, csv_bytes)
-        inner_buf.seek(0)
+            # innere ZIP erstellen (in-memory) und CSV hineinpacken
+            inner_buf = io.BytesIO()
+            with zipfile.ZipFile(inner_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf_in:
+                zf_in.writestr(csv_name, csv_bytes)
+            inner_buf.seek(0)
 
-        # Schreibe die innere ZIP in die äußere ZIP als Datei "session_<i>.zip"
-        with zipfile.ZipFile(buf_outer, "a", compression=zipfile.ZIP_DEFLATED) as zf_out:
-            zf_out.writestr(f"session_{sess_idx}.zip", inner_buf.getvalue())
+            # innere ZIP als Datei in die äußere ZIP schreiben
+            zf_out.writestr(f"session_{i+1}.zip", inner_buf.read())
 
-    buf_outer.seek(0)
-    return buf_outer.getvalue()
+    outer_buf.seek(0)
+    return outer_buf.getvalue()
 
 
 def parse_dt_from_path(path: str):
@@ -630,23 +631,31 @@ uploads = st.file_uploader(
 st.markdown("")  # kleiner Abstand
 if st.button("Demodaten laden"):
     try:
-        zip_bytes = create_test_zip(num_sessions=1, rows=400, fs=250)
-        demo_name = f"brainzz_testdata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        # Erzeuge äußere ZIP (enthält mehrere session_*.zip, jede davon eine CSV)
+        zip_bytes = create_test_zip(num_sessions=3, rows=400, fs=250)
+        demo_name = f"demodaten_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         demo_path = os.path.join(workdir, demo_name)
         with open(demo_path, "wb") as fh:
             fh.write(zip_bytes)
-        try:
-            with zipfile.ZipFile(demo_path, "r") as zf:
-                target = os.path.join(workdir, os.path.splitext(demo_name)[0] + "_extracted")
-                os.makedirs(target, exist_ok=True)
-                zf.extractall(target)
-        except Exception:
-            pass
+
+        # 1) äußere ZIP in eigenen Ordner entpacken
+        extract_target = os.path.join(workdir, os.path.splitext(demo_name)[0] + "_extracted")
+        os.makedirs(extract_target, exist_ok=True)
+        with zipfile.ZipFile(demo_path, "r") as zf:
+            zf.extractall(extract_target)
+
+        # 2) rekursives Entpacken: finde innere ZIPs in extract_target und entpacke sie
+        #    (recursively_extract_archives scannt rekursiv und entpackt .zip/.sip)
+        recursively_extract_archives(extract_target)
+
+        # 3) Nochmal sicherheitshalber im workdir (falls etwas anders gelandet ist)
         recursively_extract_archives(workdir)
+
+        # Zähle CSVs und bestätige Erfolg
         csvs_now = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
         st.success(f"Demodaten erzeugt und entpackt ({len(csvs_now)} CSV(s) verfügbar).")
     except Exception as e:
-        st.error(f"Fehler beim Erzeugen der Demodaten: {e}")
+        st.error(f"Fehler beim Erzeugen/Entpacken der Demodaten: {e}")
 
 # Falls Dateien hochgeladen wurden, speichern wir sie ins workdir
 if uploads:
