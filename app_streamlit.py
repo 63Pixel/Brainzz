@@ -49,32 +49,49 @@ workdir = get_workdir()
 # ---------------- Helfer / Testdaten ----------------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
-def create_test_zip(num_sessions: int = 1, rows: int = 400, fs: int = 250):
-    buf = io.BytesIO()
+def create_test_zip(num_sessions: int = 3, rows: int = 400, fs: int = 250):
+    """
+    Erzeugt eine äußere ZIP (Bytes), die mehrere innere ZIPs enthält.
+    Jede innere ZIP hat eine CSV namens brainzz_..._session.csv.
+    Rückgabe: bytes (äußere ZIP).
+    """
+    buf_outer = io.BytesIO()
     now = datetime.now()
-    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for i in range(num_sessions):
-            ts = (now + timedelta(seconds=i)).strftime("%Y-%m-%d--%H-%M-%S")
-            fname = f"brainzz_{ts}_session.csv"
-            t = np.arange(rows) / fs
-            rng = np.random.RandomState(100 + i)
-            delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
-            theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
-            alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
-            beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
-            gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
-            tot = delta + theta + alpha + beta + gamma + 1e-12
-            delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
-            times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
-            df = pd.DataFrame({
-                "datetime": times,
-                "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
-                "Beta_1": beta, "Gamma_1": gamma
-            })
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
-            zf.writestr(fname, csv_bytes)
-    buf.seek(0)
-    return buf.getvalue()
+
+    for sess_idx in range(1, num_sessions+1):
+        # Erzeuge CSV für diese Session
+        ts = (now + timedelta(seconds=sess_idx)).strftime("%Y-%m-%d--%H-%M-%S")
+        csv_name = f"brainzz_{ts}_session.csv"
+        t = np.arange(rows) / fs
+        rng = np.random.RandomState(100 + sess_idx)
+        delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
+        theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
+        alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
+        beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
+        gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
+        tot = delta + theta + alpha + beta + gamma + 1e-12
+        delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
+        times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
+        df = pd.DataFrame({
+            "datetime": times,
+            "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
+            "Beta_1": beta, "Gamma_1": gamma
+        })
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+
+        # Erzeuge eine innere ZIP mit genau dieser CSV
+        inner_buf = io.BytesIO()
+        with zipfile.ZipFile(inner_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf_in:
+            zf_in.writestr(csv_name, csv_bytes)
+        inner_buf.seek(0)
+
+        # Schreibe die innere ZIP in die äußere ZIP als Datei "session_<i>.zip"
+        with zipfile.ZipFile(buf_outer, "a", compression=zipfile.ZIP_DEFLATED) as zf_out:
+            zf_out.writestr(f"session_{sess_idx}.zip", inner_buf.getvalue())
+
+    buf_outer.seek(0)
+    return buf_outer.getvalue()
+
 
 def parse_dt_from_path(path: str):
     if not path:
