@@ -43,6 +43,43 @@ def get_workdir():
 workdir = get_workdir()
 
 # ---------- Helfer ----------
+def create_test_zip(num_sessions: int = 1, rows: int = 400, fs: int = 250):
+    """
+    Erzeugt ein ZIP-Archiv (in-memory) mit `num_sessions` Beispiel-CSV-Dateien.
+    Jede CSV ist im Dateinamen mit brainzz_YYYY-MM-DD--HH-MM-SS versehen, damit dein Parser sie erkennt.
+    Rückgabe: bytes (Zip-Archiv), empfohlenes Dateiname: 'brainzz_testdata.zip'
+    """
+    buf = io.BytesIO()
+    now = datetime.now()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for i in range(num_sessions):
+            # Timestamp leicht variieren
+            ts = (now + timedelta(seconds=i)).strftime("%Y-%m-%d--%H-%M-%S")
+            fname = f"brainzz_{ts}_session.csv"
+            # Erzeuge einfache Zeitstempel und relative Band-Spalten (Delta_1..Gamma_1)
+            t = np.arange(rows) / fs
+            # zufällige, aber plausible Bänder (sollten sich zu ~1 summieren)
+            rng = np.random.RandomState(100 + i)
+            delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
+            theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
+            alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
+            beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
+            gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
+            # Normieren (relative Anteile)
+            tot = delta + theta + alpha + beta + gamma + 1e-12
+            delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
+            # zeitspalte als ISO timestamps (relative to now)
+            times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
+            df = pd.DataFrame({
+                "datetime": times,
+                "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
+                "Beta_1": beta, "Gamma_1": gamma
+            })
+            csv_bytes = df.to_csv(index=False).encode("utf-8")
+            zf.writestr(fname, csv_bytes)
+    buf.seek(0)
+    return buf.getvalue()
+
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
 def parse_dt_from_path(path: str):
@@ -585,112 +622,134 @@ def build_charts(df: pd.DataFrame, smooth: int, max_points: int = 800):
 
 # ---------- UI ----------
 st.subheader("Datei-Upload")
-uploads = st.file_uploader(
-    "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
-    type=["zip", "sip", "csv"],
-    accept_multiple_files=True
-)
 
-DEFAULT_DISPLAY_MAX = 800
+# Zwei Spalten: links Upload + Presets, rechts Testdaten-Download
+col_up, col_dl = st.columns([3, 1])
 
-if uploads:
-    imported, extracted = 0, 0
-    for up in uploads:
-        fname = up.name
-        local_path = os.path.join(workdir, fname)
-        with open(local_path, "wb") as f:
-            f.write(up.getbuffer())
-        imported += 1
-        if fname.lower().endswith((".zip", ".sip")):
-            try:
-                with zipfile.ZipFile(local_path, "r") as zf:
-                    zf.extractall(os.path.join(workdir, os.path.splitext(fname)[0] + "_extracted"))
-                extracted += 1
-            except zipfile.BadZipFile:
-                st.warning(f"Beschädigtes Archiv übersprungen: {fname}")
-    recursively_extract_archives(workdir)
-    st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
+with col_up:
+    uploads = st.file_uploader(
+        "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
+        type=["zip", "sip", "csv"],
+        accept_multiple_files=True
+    )
 
-    # Anzeige-Dichte Presets (Display-Max)
-    st.markdown("**Anzeige-Dichte (für interaktive Plots)**")
-    preset = st.selectbox("Voreinstellung", ["sehr niedrig", "niedrig", "mittel (800)", "hoch", "sehr hoch", "maximum"], index=2,
-                          help="Wähle eine Voreinstellung; du kannst unten einen genauen Wert überschreiben.")
-    preset_map = {
-        "sehr niedrig": 200,
-        "niedrig": 400,
-        "mittel (800)": DEFAULT_DISPLAY_MAX,
-        "hoch": 1200,
-        "sehr hoch": 2000,
-        "maximum": 5000
-    }
-    preset_value = preset_map.get(preset, DEFAULT_DISPLAY_MAX)
-    custom_val = st.number_input("Maximal anzuzeigende Punkte (Override)", min_value=50, max_value=20000, value=int(preset_value), step=50)
-    display_max = int(custom_val) if custom_val is not None else int(preset_value)
-    st.session_state["display_max"] = display_max
+    DEFAULT_DISPLAY_MAX = 800
 
-    # grüne Auswerten-Schaltfläche (einfaches CSS)
-    st.markdown("""
-    <style>
-    div.stButton > button:first-child {
-        background-color: #28a745;
-        color: white;
-        border: none;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    if st.button("Auswertung starten", key="start_eval"):
-        recursively_extract_archives(workdir)
-        selected_csvs = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
-        if not selected_csvs:
-            st.error("Keine CSVs gefunden.")
-        else:
-            tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
-            rows, failed = [], []
-            for cp in sorted(selected_csvs):
+    if uploads:
+        imported, extracted = 0, 0
+        for up in uploads:
+            fname = up.name
+            local_path = os.path.join(workdir, fname)
+            with open(local_path, "wb") as f:
+                f.write(up.getbuffer())
+            imported += 1
+            if fname.lower().endswith((".zip", ".sip")):
                 try:
-                    pd.read_csv(cp, nrows=1)
-                except Exception:
-                    failed.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
-                    continue
-                dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
-                if dt is None:
-                    failed.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel."})
-                    continue
-                # Kein Preprocessing mehr – wir laden die relativen Bänder direkt
-                rel = load_session_relatives(cp)
-                if not is_good_rel(rel):
-                    failed.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten."})
-                    continue
-                alpha, beta  = float(rel["alpha"].mean()), float(rel["beta"].mean())
-                theta, delta = float(rel["theta"].mean()), float(rel["delta"].mean())
-                gamma        = float(rel["gamma"].mean())
-                rows.append({
-                    "datetime": dt, "alpha": alpha, "beta": beta, "theta": theta, "delta": delta, "gamma": gamma,
-                    "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
-                })
-            try:
-                shutil.rmtree(tmpdir)
-            except Exception:
-                pass
-            df = pd.DataFrame(rows)
-            if df.empty:
-                st.error("Keine gültigen Sessions.")
+                    with zipfile.ZipFile(local_path, "r") as zf:
+                        zf.extractall(os.path.join(workdir, os.path.splitext(fname)[0] + "_extracted"))
+                    extracted += 1
+                except zipfile.BadZipFile:
+                    st.warning(f"Beschädigtes Archiv übersprungen: {fname}")
+        recursively_extract_archives(workdir)
+        st.success(f"{imported} Datei(en) übernommen, {extracted} Archiv(e) entpackt.")
+
+        # Anzeige-Dichte Presets (Display-Max)
+        st.markdown("**Anzeige-Dichte (für interaktive Plots)**")
+        preset = st.selectbox("Voreinstellung", ["sehr niedrig", "niedrig", "mittel (800)", "hoch", "sehr hoch", "maximum"], index=2,
+                              help="Wähle eine Voreinstellung; du kannst unten einen genauen Wert überschreiben.")
+        preset_map = {
+            "sehr niedrig": 200,
+            "niedrig": 400,
+            "mittel (800)": DEFAULT_DISPLAY_MAX,
+            "hoch": 1200,
+            "sehr hoch": 2000,
+            "maximum": 5000
+        }
+        preset_value = preset_map.get(preset, DEFAULT_DISPLAY_MAX)
+        custom_val = st.number_input("Maximal anzuzeigende Punkte (Override)", min_value=50, max_value=20000, value=int(preset_value), step=50)
+        display_max = int(custom_val) if custom_val is not None else int(preset_value)
+        st.session_state["display_max"] = display_max
+
+        # grüne Auswerten-Schaltfläche (einfaches CSS)
+        st.markdown("""
+        <style>
+        div.stButton > button:first-child {
+            background-color: #28a745;
+            color: white;
+            border: none;
+        }
+        </style>
+        """, unsafe_allow_html=True)
+
+        if st.button("Auswertung starten", key="start_eval"):
+            recursively_extract_archives(workdir)
+            selected_csvs = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
+            if not selected_csvs:
+                st.error("Keine CSVs gefunden.")
             else:
-                df = df.sort_values("datetime").reset_index(drop=True)
-                df["date_str"] = df["datetime"].dt.strftime("%Y-%m-%d %H:%M")
-                st.session_state["df_summary"] = df.copy()
-                st.session_state["last_smooth"] = st.session_state.get("last_smooth", 2)
-                st.session_state["charts"] = build_charts(df, st.session_state.get("last_smooth", 2), max_points=display_max)
-                st.success(f"{len(df)} Session(s) ausgewertet. Anzeige unten aktualisiert.")
-            if failed:
-                st.subheader("Übersprungene Dateien")
-                for f in failed:
-                    st.warning(f"{f['source']}: {f['reason']}")
+                tmpdir = tempfile.mkdtemp(prefix="eeg_proc_")
+                rows, failed = [], []
+                for cp in sorted(selected_csvs):
+                    try:
+                        pd.read_csv(cp, nrows=1)
+                    except Exception:
+                        failed.append({"source": os.path.basename(cp), "reason": "Keine CSV (evtl. ZIP)."})
+                        continue
+                    dt = parse_dt_from_path(cp) or parse_dt_from_path(os.path.dirname(cp))
+                    if dt is None:
+                        failed.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel."})
+                        continue
+                    # Kein Preprocessing mehr – wir laden die relativen Bänder direkt
+                    rel = load_session_relatives(cp)
+                    if not is_good_rel(rel):
+                        failed.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten."})
+                        continue
+                    alpha, beta  = float(rel["alpha"].mean()), float(rel["beta"].mean())
+                    theta, delta = float(rel["theta"].mean()), float(rel["delta"].mean())
+                    gamma        = float(rel["gamma"].mean())
+                    rows.append({
+                        "datetime": dt, "alpha": alpha, "beta": beta, "theta": theta, "delta": delta, "gamma": gamma,
+                        "stress": beta/(alpha+1e-9), "relax": alpha/(beta+1e-9), "source": os.path.basename(cp)
+                    })
+                try:
+                    shutil.rmtree(tmpdir)
+                except Exception:
+                    pass
+                df = pd.DataFrame(rows)
+                if df.empty:
+                    st.error("Keine gültigen Sessions.")
+                else:
+                    df = df.sort_values("datetime").reset_index(drop=True)
+                    df["date_str"] = df["datetime"].dt.strftime("%Y-%m-%d %H:%M")
+                    st.session_state["df_summary"] = df.copy()
+                    st.session_state["last_smooth"] = st.session_state.get("last_smooth", 2)
+                    st.session_state["charts"] = build_charts(df, st.session_state.get("last_smooth", 2), max_points=display_max)
+                    st.success(f"{len(df)} Session(s) ausgewertet. Anzeige unten aktualisiert.")
+                if failed:
+                    st.subheader("Übersprungene Dateien")
+                    for f in failed:
+                        st.warning(f"{f['source']}: {f['reason']}")
 
 # ensure display_max default exists
 if "display_max" not in st.session_state:
     st.session_state["display_max"] = DEFAULT_DISPLAY_MAX
+
+with col_dl:
+    st.markdown("**Testdaten**")
+    st.caption("Lade eine ZIP mit Beispiel-CSVs herunter (zum Testen).")
+    try:
+        # Erzeuge eine kleine Test-ZIP (1 Session, 400 Reihen)
+        zip_bytes = create_test_zip(num_sessions=1, rows=400, fs=250)
+        st.download_button(
+            label="Testdaten herunterladen",
+            data=zip_bytes,
+            file_name="brainzz_testdata.zip",
+            mime="application/zip"
+        )
+        st.caption("Dateiname im ZIP: brainzz_YYYY-MM-DD--HH-MM-SS_session.csv — direkt wieder hier hochladen zum Test.")
+    except Exception as e:
+        st.error(f"Fehler beim Erstellen der Testdaten: {e}")
+
 
 # ---------- Parameter / QC (vereinfacht) ----------
 st.subheader("")
