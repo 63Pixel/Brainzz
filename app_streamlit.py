@@ -725,7 +725,7 @@ with st.expander("Workflow", expanded=False):
     **Auswertung starten (grün)**  
     Startet die Analyse aller gefundenen CSVs im Arbeitsordner. Nach Abschluss siehst du die ausgewerteten Sessions und ggf. übersprungene Dateien.
 
-    **Export (JPG, Qualität 80%)**  
+    **Export (JPG)**  
     Erstellt ein JPG (80 % Qualität). Dateiname = Session-Name (z. B. `brainzz_2025-09-16--06-17-25`). Du kannst nur die Timeline oder Timeline + Balken exportieren.
 
     **Wenn die Timeline leer ist**  
@@ -783,7 +783,7 @@ if not df_show.empty:
                        file_name="summary_indices.csv", mime="text/csv")
 
 # ---------- Export (JPG) ----------
-st.subheader("Export (JPG, Qualität 80%)")
+st.subheader("Export (JPG)")
 if df_show.empty:
     st.info("Keine Auswertung im Speicher. Erst „Auswertung starten“.")
 else:
@@ -865,3 +865,9 @@ with st.expander("Debug / Wartung", expanded=False):
         for k in ["workdir", "df_summary", "charts", "render_path", "last_smooth", "display_max"]:
             st.session_state.pop(k, None)
         st.success("Arbeitsordner geleert. Seite neu laden.")
+
+# Copyright-Hinweis (zentriert, dezent)
+st.markdown(
+    f"<div style='text-align:center; color:#666; font-size:12px; margin-top:10px;'>© Stefan Nitz {datetime.now().year}</div>",
+    unsafe_allow_html=True
+)
