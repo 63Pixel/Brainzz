@@ -3,9 +3,9 @@
 # EEG-Auswertung – simplified UI: no Y-Achse option, no Sampling-Rate/preprocessing in UI
 # Timeline first, then bar. JPG export (quality 80%). Downsampling presets available.
 #
-# Änderungen:
-# - Dropbox-Download-Button: lädt beim Klick die ZIP gestreamt in workdir/downloads und bietet sie zum Download an.
-# - benötigte Importe für Dropbox-Handling hinzugefügt.
+# Änderung (auf Wunsch):
+# - rechter Bereich enthält jetzt einen Button "Demodaten laden", der Beispiel-CSVs in workdir legt
+# - danach kann direkt "Auswertung starten" ausgeführt werden
 
 import os
 import re
@@ -13,19 +13,15 @@ import glob
 import zipfile
 import tempfile
 import shutil
-from datetime import datetime
-from datetime import timedelta
+from datetime import datetime, timedelta
 import io
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
-
-# neue Importe für Dropbox/HTTP-Download
-import requests
-from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 # Pillow for PNG->JPG conversion (required for JPG export)
 try:
@@ -55,29 +51,24 @@ workdir = get_workdir()
 def create_test_zip(num_sessions: int = 1, rows: int = 400, fs: int = 250):
     """
     Erzeugt ein ZIP-Archiv (in-memory) mit `num_sessions` Beispiel-CSV-Dateien.
-    Jede CSV ist im Dateinamen mit brainzz_YYYY-MM-DD--HH-MM-SS versehen, damit dein Parser sie erkennt.
-    Rückgabe: bytes (Zip-Archiv), empfohlenes Dateiname: 'brainzz_testdata.zip'
+    Jede CSV ist im Dateinamen mit brainzz_YYYY-MM-DD--HH-MM-SS versehen, damit der Parser sie erkennt.
+    Rückgabe: bytes (Zip-Archiv)
     """
     buf = io.BytesIO()
     now = datetime.now()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for i in range(num_sessions):
-            # Timestamp leicht variieren
             ts = (now + timedelta(seconds=i)).strftime("%Y-%m-%d--%H-%M-%S")
             fname = f"brainzz_{ts}_session.csv"
-            # Erzeuge einfache Zeitstempel und relative Band-Spalten (Delta_1..Gamma_1)
             t = np.arange(rows) / fs
-            # zufällige, aber plausible Bänder (sollten sich zu ~1 summieren)
             rng = np.random.RandomState(100 + i)
             delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
             theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
             alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
             beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
             gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
-            # Normieren (relative Anteile)
             tot = delta + theta + alpha + beta + gamma + 1e-12
             delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
-            # zeitspalte als ISO timestamps (relative to now)
             times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
             df = pd.DataFrame({
                 "datetime": times,
@@ -106,12 +97,6 @@ def format_session_filename(dt: datetime):
     if not isinstance(dt, datetime):
         return None
     return f"brainzz_{dt.strftime('%Y-%m-%d--%H-%M-%S')}"
-
-def get_mtime(path: str):
-    try:
-        return os.path.getmtime(path)
-    except Exception:
-        return None
 
 def roll_mean(s, w):
     return s.rolling(window=max(1, int(w)), center=True, min_periods=1).mean()
@@ -156,7 +141,6 @@ def is_good_rel(df):
     return isinstance(df, pd.DataFrame) and not df.empty and all(c in df.columns for c in ["alpha", "beta", "theta", "delta", "gamma"])
 
 # ---------- Laden der relativen Bandanteile ----------
-# wir erwarten in CSV Spalten Delta_*, Theta_*, Alpha_*, Beta_*, Gamma_* oder direkte Delta/Theta/... Spalten
 def load_session_relatives(csv_path, agg="power"):
     try:
         df = pd.read_csv(csv_path, low_memory=False)
@@ -170,7 +154,6 @@ def load_session_relatives(csv_path, agg="power"):
     for b in bands:
         try:
             val = df[cols[b]].apply(pd.to_numeric, errors="coerce")
-            # simple handling: use mean across channels
             out[b.lower()] = val.mean(axis=1)
         except Exception:
             return None
@@ -229,7 +212,6 @@ def plot_stress_relax(df, smooth=1, max_points=800):
     return fig
 
 def plot_bands(df, smooth=1, max_points=800):
-    # y-mode fixed to "0–1 (fix)"
     d = df.copy()
     d["stresswave"] = d["beta"] + d["gamma"]
     d["relaxwave"]  = d["alpha"] + d["theta"]
@@ -282,7 +264,6 @@ def plot_bands(df, smooth=1, max_points=800):
     return fig
 
 # ---------- Einzel-Session Timeline (Plotly) ----------
-# internal fallback sampling rate for time axis if no datetime column present
 FALLBACK_FS = 250.0
 
 def plot_single_session_timeline(csv_path, smooth_seconds=3, max_points=800):
@@ -487,8 +468,7 @@ def render_single_session_timeline_matplotlib(csv_path: str, smooth_seconds=3, o
     if len(tick_labels) > 0:
         ax.set_xticks(np.linspace(0, len(dec_x)-1, num=len(tick_positions), dtype=int))
         ax.set_xticklabels(tick_labels, rotation=45, ha="right")
-    if True:
-        ax.set_ylim(0,1)
+    ax.set_ylim(0,1)
     ax.set_ylabel("Relativer Anteil")
     ax.legend(ncol=4, fontsize="small", loc="upper center", bbox_to_anchor=(0.5,1.22))
     fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
@@ -629,26 +609,10 @@ def build_charts(df: pd.DataFrame, smooth: int, max_points: int = 800):
         charts["bands"]  = plot_bands(df, smooth=smooth, max_points=max_points)
     return charts
 
-# ---------- Dropbox helper ----------
-def make_direct_dropbox_link(share_link: str) -> str:
-    """
-    Nimmt einen Dropbox-Freigabelink und liefert eine direkte Download-URL zurück.
-    Beispiel: ersetzt ?dl=0 mit ?dl=1 und wandelt domain ggf. zu dl.dropboxusercontent.com.
-    """
-    if not share_link:
-        raise ValueError("Kein Link angegeben.")
-    parsed = urlparse(share_link)
-    qs = parse_qs(parsed.query)
-    qs["dl"] = ["1"]
-    new_query = urlencode(qs, doseq=True)
-    direct = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
-    direct = direct.replace("www.dropbox.com", "dl.dropboxusercontent.com")
-    return direct
-
 # ---------- UI ----------
 st.subheader("Datei-Upload")
 
-# Zwei Spalten: links Upload + Presets, rechts Testdaten-Download
+# Zwei Spalten: links Upload + Presets, rechts Testdaten-Load
 col_up, col_dl = st.columns([3, 1])
 
 with col_up:
@@ -724,7 +688,6 @@ with col_up:
                     if dt is None:
                         failed.append({"source": os.path.basename(cp), "reason": "Ungültiger Zeitstempel."})
                         continue
-                    # Kein Preprocessing mehr – wir laden die relativen Bänder direkt
                     rel = load_session_relatives(cp)
                     if not is_good_rel(rel):
                         failed.append({"source": os.path.basename(cp), "reason": "Keine gültigen Bandspalten."})
@@ -757,47 +720,34 @@ with col_up:
 
 # ensure display_max default exists
 if "display_max" not in st.session_state:
-    st.session_state["display_max"] = DEFAULT_DISPLAY_MAX
+    st.session_state["display_max"] = 800
 
 with col_dl:
-    st.markdown("**Testdaten**")
-    st.caption("Lade eine ZIP mit Beispiel-CSVs herunter (zum Testen) oder lade die Demo direkt von Dropbox.")
-    # Default Dropbox-Link (deinen Link als Voreinstellung)
-    default_dropbox = "https://www.dropbox.com/scl/fi/ktn1683bsksuuw2vn4lcx/Demodaten.zip?rlkey=2ikg37dp7dhfdpcb332lz3osd&dl=0"
-    dropbox_link = st.text_input("Dropbox-Freigabe-Link", value=default_dropbox)
-
-    if st.button("Dropbox: Datei laden und anbieten"):
+    st.markdown("**Demodaten**")
+    st.caption("Lege Beispiel-Sessions in den Arbeitsordner, damit du die Auswertung testen kannst.")
+    # Einfacher Button: erzeugt Demo-ZIP mit 1 Session (400 rows) und entpackt in workdir
+    if st.button("Demodaten laden"):
         try:
-            direct = make_direct_dropbox_link(dropbox_link)
-        except Exception as e:
-            st.error(f"Ungültiger Dropbox-Link: {e}")
-            direct = None
-
-        if direct:
-            fname = os.path.basename(urlparse(direct).path) or "demodaten.zip"
-            dest_dir = os.path.join(workdir, "downloads")
-            os.makedirs(dest_dir, exist_ok=True)
-            dest_path = os.path.join(dest_dir, fname)
-
+            zip_bytes = create_test_zip(num_sessions=1, rows=400, fs=250)
+            demo_name = f"brainzz_testdata_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+            demo_path = os.path.join(workdir, demo_name)
+            with open(demo_path, "wb") as fh:
+                fh.write(zip_bytes)
+            # entpacken
             try:
-                with st.spinner("Lade Datei von Dropbox…"):
-                    # Streamed Download, schreibt in workdir (vermeidet OOM)
-                    with requests.get(direct, stream=True, timeout=60) as r:
-                        r.raise_for_status()
-                        with open(dest_path, "wb") as fh:
-                            for chunk in r.iter_content(chunk_size=8192):
-                                if chunk:
-                                    fh.write(chunk)
-                st.success(f"Datei geladen: {fname}")
-                # Biete die Datei zum Download an (liest file bytes)
-                with open(dest_path, "rb") as fh:
-                    file_bytes = fh.read()
-                st.download_button("Testdaten herunterladen (von Dropbox)", data=file_bytes,
-                                   file_name=fname, mime="application/zip")
-                st.caption("Hinweis: Wenn die Datei sehr groß ist, kann Laden/Darstellen einige Zeit dauern.")
-            except Exception as e:
-                st.error(f"Fehler beim Laden von Dropbox: {e}")
-                st.markdown(f"Alternativ: [Öffne den direkten Link im Browser]({direct})")
+                with zipfile.ZipFile(demo_path, "r") as zf:
+                    target = os.path.join(workdir, os.path.splitext(demo_name)[0] + "_extracted")
+                    os.makedirs(target, exist_ok=True)
+                    zf.extractall(target)
+            except Exception:
+                pass
+            # run recursive extraction (marks archives) — not strictly necessary but consistent
+            recursively_extract_archives(workdir)
+            # inform user
+            csvs_now = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
+            st.success(f"Demodaten erzeugt und entpackt ({len(csvs_now)} CSV(s) verfügbar). Klicke nun auf 'Auswertung starten'.")
+        except Exception as e:
+            st.error(f"Fehler beim Erzeugen der Demodaten: {e}")
 
 # ---------- Parameter / QC (vereinfacht) ----------
 st.subheader("")
@@ -850,7 +800,7 @@ st.info(f"Gefundene CSVs: {n_csv} — Gesamtgröße: {total_mb:.1f} MB")
 # Rebuild charts when params changed
 if "df_summary" in st.session_state and not st.session_state["df_summary"].empty:
     if st.session_state.get("last_smooth") != smooth or st.session_state.get("display_max") != st.session_state.get("display_max"):
-        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, max_points=st.session_state.get("display_max", DEFAULT_DISPLAY_MAX))
+        st.session_state["charts"] = build_charts(st.session_state["df_summary"], smooth, max_points=st.session_state.get("display_max", 800))
         st.session_state["last_smooth"] = smooth
 
 # ---------- Anzeige (Timeline zuerst, dann Balken) ----------
@@ -865,7 +815,7 @@ if not df_show.empty:
         csv_name = df_show.iloc[0]["source"]
         csv_path = find_csv_by_basename(csv_name, workdir)
         if csv_path:
-            fig_ts = plot_single_session_timeline(csv_path, smooth_seconds=ss_smooth, max_points=st.session_state.get("display_max", DEFAULT_DISPLAY_MAX))
+            fig_ts = plot_single_session_timeline(csv_path, smooth_seconds=ss_smooth, max_points=st.session_state.get("display_max", 800))
             st.plotly_chart(fig_ts, use_container_width=True)
         else:
             st.info("Original-CSV für die Einzel-Session wurde nicht gefunden.")
@@ -875,10 +825,10 @@ if not df_show.empty:
         st.dataframe(df_show.round(4))
     else:
         st.subheader("Stress/Entspannung")
-        fig1 = charts.get("stress") or plot_stress_relax(df_show, smooth=smooth, max_points=st.session_state.get("display_max", DEFAULT_DISPLAY_MAX))
+        fig1 = charts.get("stress") or plot_stress_relax(df_show, smooth=smooth, max_points=st.session_state.get("display_max", 800))
         st.plotly_chart(fig1, use_container_width=True)
         st.subheader("Bänder + Wellen")
-        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth, max_points=st.session_state.get("display_max", DEFAULT_DISPLAY_MAX))
+        fig2 = charts.get("bands") or plot_bands(df_show, smooth=smooth, max_points=st.session_state.get("display_max", 800))
         st.plotly_chart(fig2, use_container_width=True)
         st.subheader("Tabelle")
         st.dataframe(df_show.round(4))
