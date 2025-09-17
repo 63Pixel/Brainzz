@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 # EEG-Auswertung – simplified UI: no Y-Achse option, no Sampling-Rate/preprocessing in UI
 # Timeline first, then bar. JPG export (quality 80%). Downsampling presets available.
+#
+# Änderungen:
+# - Dropbox-Download-Button: lädt beim Klick die ZIP gestreamt in workdir/downloads und bietet sie zum Download an.
+# - benötigte Importe für Dropbox-Handling hinzugefügt.
 
 import os
 import re
@@ -18,6 +22,10 @@ import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
 import plotly.io as pio
+
+# neue Importe für Dropbox/HTTP-Download
+import requests
+from urllib.parse import urlparse, urlunparse, parse_qs, urlencode
 
 # Pillow for PNG->JPG conversion (required for JPG export)
 try:
@@ -621,6 +629,22 @@ def build_charts(df: pd.DataFrame, smooth: int, max_points: int = 800):
         charts["bands"]  = plot_bands(df, smooth=smooth, max_points=max_points)
     return charts
 
+# ---------- Dropbox helper ----------
+def make_direct_dropbox_link(share_link: str) -> str:
+    """
+    Nimmt einen Dropbox-Freigabelink und liefert eine direkte Download-URL zurück.
+    Beispiel: ersetzt ?dl=0 mit ?dl=1 und wandelt domain ggf. zu dl.dropboxusercontent.com.
+    """
+    if not share_link:
+        raise ValueError("Kein Link angegeben.")
+    parsed = urlparse(share_link)
+    qs = parse_qs(parsed.query)
+    qs["dl"] = ["1"]
+    new_query = urlencode(qs, doseq=True)
+    direct = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
+    direct = direct.replace("www.dropbox.com", "dl.dropboxusercontent.com")
+    return direct
+
 # ---------- UI ----------
 st.subheader("Datei-Upload")
 
@@ -737,20 +761,43 @@ if "display_max" not in st.session_state:
 
 with col_dl:
     st.markdown("**Testdaten**")
-    st.caption("Lade eine ZIP mit Beispiel-CSVs herunter (zum Testen).")
-    try:
-        # Erzeuge eine kleine Test-ZIP (1 Session, 400 Reihen)
-        zip_bytes = create_test_zip(num_sessions=1, rows=400, fs=250)
-        st.download_button(
-            label="Testdaten herunterladen",
-            data=zip_bytes,
-            file_name="brainzz_testdata.zip",
-            mime="application/zip"
-        )
-        st.caption("Dateiname im ZIP: brainzz_YYYY-MM-DD--HH-MM-SS_session.csv — direkt wieder hier hochladen zum Test.")
-    except Exception as e:
-        st.error(f"Fehler beim Erstellen der Testdaten: {e}")
+    st.caption("Lade eine ZIP mit Beispiel-CSVs herunter (zum Testen) oder lade die Demo direkt von Dropbox.")
+    # Default Dropbox-Link (deinen Link als Voreinstellung)
+    default_dropbox = "https://www.dropbox.com/scl/fi/ktn1683bsksuuw2vn4lcx/Demodaten.zip?rlkey=2ikg37dp7dhfdpcb332lz3osd&dl=0"
+    dropbox_link = st.text_input("Dropbox-Freigabe-Link", value=default_dropbox)
 
+    if st.button("Dropbox: Datei laden und anbieten"):
+        try:
+            direct = make_direct_dropbox_link(dropbox_link)
+        except Exception as e:
+            st.error(f"Ungültiger Dropbox-Link: {e}")
+            direct = None
+
+        if direct:
+            fname = os.path.basename(urlparse(direct).path) or "demodaten.zip"
+            dest_dir = os.path.join(workdir, "downloads")
+            os.makedirs(dest_dir, exist_ok=True)
+            dest_path = os.path.join(dest_dir, fname)
+
+            try:
+                with st.spinner("Lade Datei von Dropbox…"):
+                    # Streamed Download, schreibt in workdir (vermeidet OOM)
+                    with requests.get(direct, stream=True, timeout=60) as r:
+                        r.raise_for_status()
+                        with open(dest_path, "wb") as fh:
+                            for chunk in r.iter_content(chunk_size=8192):
+                                if chunk:
+                                    fh.write(chunk)
+                st.success(f"Datei geladen: {fname}")
+                # Biete die Datei zum Download an (liest file bytes)
+                with open(dest_path, "rb") as fh:
+                    file_bytes = fh.read()
+                st.download_button("Testdaten herunterladen (von Dropbox)", data=file_bytes,
+                                   file_name=fname, mime="application/zip")
+                st.caption("Hinweis: Wenn die Datei sehr groß ist, kann Laden/Darstellen einige Zeit dauern.")
+            except Exception as e:
+                st.error(f"Fehler beim Laden von Dropbox: {e}")
+                st.markdown(f"Alternativ: [Öffne den direkten Link im Browser]({direct})")
 
 # ---------- Parameter / QC (vereinfacht) ----------
 st.subheader("")
