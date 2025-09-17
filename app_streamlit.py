@@ -49,49 +49,56 @@ workdir = get_workdir()
 # ---------------- Helfer / Testdaten ----------------
 PAT = re.compile(r"brainzz_(\d{4}-\d{2}-\d{2}--\d{2}-\d{2}-\d{2})")
 
-def create_test_zip(num_sessions: int = 3, rows: int = 400, fs: int = 250):
+def create_test_zip_nested(num_archives: int = 12, rows: int = 400, fs: int = 250, csvs_per_archive: int = 1):
     """
-    Erzeugt eine äußere ZIP (Bytes), die mehrere innere ZIPs enthält.
-    Jede innere ZIP hat eine CSV namens brainzz_..._session.csv.
+    Erzeugt eine äußere ZIP-Bytes, die viele innere ZIPs enthält.
+    Jede innere ZIP heißt 'brainzz_YYYY-MM-DD--HH-MM-SS.zip' (wie in deinem Screenshot)
+    und enthält `csvs_per_archive` CSV-Dateien mit relativen Bandspalten.
     Rückgabe: bytes (äußere ZIP).
     """
-    outer_buf = io.BytesIO()
+    outer = io.BytesIO()
     now = datetime.now()
 
-    # Erzeuge äußere ZIP
-    with zipfile.ZipFile(outer_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf_out:
-        for i in range(num_sessions):
-            # CSV-Inhalt erzeugen
-            ts = (now + timedelta(seconds=i)).strftime("%Y-%m-%d--%H-%M-%S")
-            csv_name = f"brainzz_{ts}_session.csv"
-            t = np.arange(rows) / fs
-            rng = np.random.RandomState(100 + i)
-            delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
-            theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
-            alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
-            beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
-            gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
-            tot = delta + theta + alpha + beta + gamma + 1e-12
-            delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
-            times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
-            df = pd.DataFrame({
-                "datetime": times,
-                "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
-                "Beta_1": beta, "Gamma_1": gamma
-            })
-            csv_bytes = df.to_csv(index=False).encode("utf-8")
+    with zipfile.ZipFile(outer, "w", compression=zipfile.ZIP_DEFLATED) as zf_out:
+        for i in range(num_archives):
+            # Name der inneren ZIP (wie bei dir)
+            ts_arch = (now + timedelta(days=i)).strftime("%Y-%m-%d--%H-%M-%S")
+            inner_zip_name = f"brainzz_{ts_arch}.zip"
 
-            # innere ZIP erstellen (in-memory) und CSV hineinpacken
+            # Erzeuge innere ZIP im Speicher
             inner_buf = io.BytesIO()
             with zipfile.ZipFile(inner_buf, "w", compression=zipfile.ZIP_DEFLATED) as zf_in:
-                zf_in.writestr(csv_name, csv_bytes)
+                for j in range(csvs_per_archive):
+                    # CSV-Name: kann sich leicht unterscheiden (z. B. session suffix)
+                    ts_csv = (now + timedelta(days=i, seconds=j)).strftime("%Y-%m-%d--%H-%M-%S")
+                    csv_name = f"brainzz_{ts_csv}_session.csv"
+
+                    # Erzeuge einfache Beispiel-CSV (datetime + Delta_/Theta_/... Spalten)
+                    t = np.arange(rows) / fs
+                    rng = np.random.RandomState(100 + i*10 + j)
+                    delta = np.abs(rng.normal(loc=0.2, scale=0.03, size=rows))
+                    theta = np.abs(rng.normal(loc=0.15, scale=0.03, size=rows))
+                    alpha = np.abs(rng.normal(loc=0.35, scale=0.05, size=rows))
+                    beta  = np.abs(rng.normal(loc=0.2, scale=0.04, size=rows))
+                    gamma = np.abs(rng.normal(loc=0.1, scale=0.02, size=rows))
+                    tot = delta + theta + alpha + beta + gamma + 1e-12
+                    delta /= tot; theta /= tot; alpha /= tot; beta /= tot; gamma /= tot
+                    times = (pd.Timestamp.now() + pd.to_timedelta(np.round(t).astype(int), unit="s")).strftime("%Y-%m-%d %H:%M:%S")
+
+                    df = pd.DataFrame({
+                        "datetime": times,
+                        "Delta_1": delta, "Theta_1": theta, "Alpha_1": alpha,
+                        "Beta_1": beta, "Gamma_1": gamma
+                    })
+                    csv_bytes = df.to_csv(index=False).encode("utf-8")
+                    zf_in.writestr(csv_name, csv_bytes)
+
             inner_buf.seek(0)
+            # Schreibe die innere ZIP als Datei in die äußere ZIP
+            zf_out.writestr(inner_zip_name, inner_buf.getvalue())
 
-            # innere ZIP als Datei in die äußere ZIP schreiben
-            zf_out.writestr(f"session_{i+1}.zip", inner_buf.read())
-
-    outer_buf.seek(0)
-    return outer_buf.getvalue()
+    outer.seek(0)
+    return outer.getvalue()
 
 
 def parse_dt_from_path(path: str):
@@ -631,27 +638,23 @@ uploads = st.file_uploader(
 st.markdown("")  # kleiner Abstand
 if st.button("Demodaten laden"):
     try:
-        # Erzeuge äußere ZIP (enthält mehrere session_*.zip, jede davon eine CSV)
-        zip_bytes = create_test_zip(num_sessions=3, rows=400, fs=250)
+        zip_bytes = create_test_zip_nested(num_archives=12, rows=400, fs=250, csvs_per_archive=1)
         demo_name = f"demodaten_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
         demo_path = os.path.join(workdir, demo_name)
         with open(demo_path, "wb") as fh:
             fh.write(zip_bytes)
 
-        # 1) äußere ZIP in eigenen Ordner entpacken
+        # 1) äußere ZIP entpacken in eigenen Zielordner
         extract_target = os.path.join(workdir, os.path.splitext(demo_name)[0] + "_extracted")
         os.makedirs(extract_target, exist_ok=True)
         with zipfile.ZipFile(demo_path, "r") as zf:
             zf.extractall(extract_target)
 
-        # 2) rekursives Entpacken: finde innere ZIPs in extract_target und entpacke sie
-        #    (recursively_extract_archives scannt rekursiv und entpackt .zip/.sip)
-        recursively_extract_archives(extract_target)
+        # 2) rekursiv entpacken: innere ZIPs, evtl. weitere Ebenen
+        recursively_extract_archives(extract_target)   # entpackt inner ZIPs im extract_target
+        recursively_extract_archives(workdir)         # nochmal global, falls etwas anders liegt
 
-        # 3) Nochmal sicherheitshalber im workdir (falls etwas anders gelandet ist)
-        recursively_extract_archives(workdir)
-
-        # Zähle CSVs und bestätige Erfolg
+        # 3) Zähle CSVs und zeige an
         csvs_now = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
         st.success(f"Demodaten erzeugt und entpackt ({len(csvs_now)} CSV(s) verfügbar).")
     except Exception as e:
