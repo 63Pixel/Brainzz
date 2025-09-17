@@ -791,13 +791,43 @@ if st.button("Auswertung starten", key="start_eval"):
 st.subheader("")
 with st.expander("Workflow", expanded=False):
     st.markdown("""
+    ### Kurz-Hilfe — Parameter
+
     **Anzeige-Dichte (Voreinstellung / Max. Punkte)**  
     Bestimmt, wie viele Datenpunkte in den interaktiven Diagrammen angezeigt werden.
 
+    - **Niedrigere Werte** → schnelleres Laden und flüssigere Bedienung, weniger Details.  
+    - **Höhere Werte** → mehr Detail, kann die App verlangsamen.
+
+    **Voreinstellungen:** `sehr niedrig (200)`, `niedrig (400)`, **mittel (800)**, `hoch (1200)`, `sehr hoch (2000)`, `maximum (5000)`.
+
+    ---
+
+    **Glättungsfenster (Sessions)**  
+    Glatte Darstellung über mehrere Sessions (Zusammenfassung).
+
+    - `1` = keine Glättung, höhere Werte glätten stärker.  
+    - Empfehlung: **2–4** für normale Daten.
+
+    **Glättung (Sekunden) — Einzel-Session (Timeline)**  
+    Glättet den zeitlichen Verlauf innerhalb einer einzelnen Session.
+
+    - `0` = keine Glättung.  
+    - Empfehlung: **2–5 Sekunden**.
+
+    ---
+
+    **Auswertung starten (grün)**  
+    Startet die Analyse aller gefundenen CSVs im Arbeitsordner. Nach Abschluss siehst du die ausgewerteten Sessions und ggf. übersprungene Dateien.
+
+    **Export (JPG)**  
+    Erstellt ein JPG (80 % Qualität). Dateiname = Session-Name (z. B. `brainzz_2025-09-16--06-17-25`). Du kannst nur die Timeline oder Timeline + Balken exportieren.
+
+    **Wenn die Timeline leer ist**  
+    Stelle sicher, dass die CSV eine Zeitspalte enthält (z. B. `timestamp`, `time`, `datetime`) — sonst wird ein Zeitsprung-Fallback benutzt.
     - Niedrigere Werte → schnelleres Laden und flüssigere Bedienung.  
     - Höhere Werte → mehr Details, langsamer.
     """)
-
 smooth = st.slider("Glättungsfenster (Sessions)", 1, 15, 2, 1)
 st.session_state["last_smooth"] = smooth
 
