@@ -33,7 +33,6 @@ import matplotlib.pyplot as plt
 # Basic config
 st.set_page_config(page_title="EEG-Auswertung", layout="wide")
 st.title("EEG-Auswertung")
-st.caption("Datei-Upload (ZIP/SIP/CSV) → Entpacken → Auswertung → Export als JPG (Qualität 80%)")
 
 # ---------- Arbeitsverzeichnis ----------
 def get_workdir():
@@ -585,7 +584,7 @@ def build_charts(df: pd.DataFrame, smooth: int, max_points: int = 800):
     return charts
 
 # ---------- UI ----------
-st.subheader("1) Datei-Upload")
+st.subheader("Datei-Upload")
 uploads = st.file_uploader(
     "Dateien hochladen (ZIP/SIP mit CSVs oder einzelne CSVs)",
     type=["zip", "sip", "csv"],
@@ -694,42 +693,45 @@ if "display_max" not in st.session_state:
     st.session_state["display_max"] = DEFAULT_DISPLAY_MAX
 
 # ---------- Parameter / QC (vereinfacht) ----------
-st.subheader("2) Parameter / QC")
-with st.expander("Hilfe zu Parametern", expanded=False):
+st.subheader("")
+with st.expander("Workflow", expanded=False):
     st.markdown("""
-Anzeige-Dichte (Voreinstellung / Max. Punkte)
-Bestimmt, wie viele Datenpunkte in den interaktiven Diagrammen angezeigt werden.
+    ### Kurz-Hilfe — Parameter
 
-Niedrigere Werte → schnelleres Laden und flüssigere Bedienung, weniger Details.
+    **Anzeige-Dichte (Voreinstellung / Max. Punkte)**  
+    Bestimmt, wie viele Datenpunkte in den interaktiven Diagrammen angezeigt werden.
 
-Höhere Werte → mehr Detail, kann die App verlangsamen.
-Voreinstellungen: sehr niedrig (200), niedrig (400), mittel (800), hoch (1200), sehr hoch (2000), maximum (5000). Standard = 800. Du kannst die Zahl manuell überschreiben.
+    - **Niedrigere Werte** → schnelleres Laden und flüssigere Bedienung, weniger Details.  
+    - **Höhere Werte** → mehr Detail, kann die App verlangsamen.
 
-Glättungsfenster (Sessions)
-Glatte Darstellung über mehrere Sessions (Zusammenfassung).
+    **Voreinstellungen:** `sehr niedrig (200)`, `niedrig (400)`, **mittel (800)**, `hoch (1200)`, `sehr hoch (2000)`, `maximum (5000)`.
 
-Wert = Anzahl der Samples/Frames im Gleit-Fenster.
+    ---
 
-1 = keine Glättung, höhere Werte glätten stärker.
-Empfehlung: 2–4 für normale Daten — größer, wenn die Kurve zu „sprunghaft“ aussieht.
+    **Glättungsfenster (Sessions)**  
+    Glatte Darstellung über mehrere Sessions (Zusammenfassung).
 
-Glättung (Sekunden) — Einzel-Session (Timeline)
-Glättet den zeitlichen Verlauf innerhalb einer einzelnen Session.
+    - `1` = keine Glättung, höhere Werte glätten stärker.  
+    - Empfehlung: **2–4** für normale Daten.
 
-0 = keine Glättung.
+    **Glättung (Sekunden) — Einzel-Session (Timeline)**  
+    Glättet den zeitlichen Verlauf innerhalb einer einzelnen Session.
 
-Größere Werte glätten kurzfristige Schwankungen über die angegebene Sekundenzahl.
-Praktisch: 2–5 Sekunden für hör-/sichtbare Signale, mehr bei sehr noisigen Messungen.
+    - `0` = keine Glättung.  
+    - Empfehlung: **2–5 Sekunden**.
 
-Auswertung starten (grün)
-Startet die Analyse aller gefundenen CSVs im Arbeitsordner. Die App sucht in den CSVs nach Band-Spalten (Delta/Theta/Alpha/Beta/Gamma). Nach Abschluss siehst du die ausgewerteten Sessions und eine Liste übersprungener/fehlerhafter Dateien.
+    ---
 
-Export (JPG, Qualität 80%)
-Erstellt ein JPG (80 % Qualität). Dateiname = Session-Name (z. B. brainzz_2025-09-16--06-17-25). Du kannst nur die Timeline oder Timeline+Balkendiagramm exportieren. Renderzeit hängt von Länge der Session und gewählter Anzeige-Dichte ab.
+    **Auswertung starten (grün)**  
+    Startet die Analyse aller gefundenen CSVs im Arbeitsordner. Nach Abschluss siehst du die ausgewerteten Sessions und ggf. übersprungene Dateien.
 
-Wenn die Timeline leer ist
-Stelle sicher, dass die CSV eine Zeitspalte enthält (z. B. timestamp, time, datetime, uhrzeit) oder Sekundenwerte. Fehlen Zeitangaben, verwendet die App einen Fallback (laufende Sekunden), dann wird die x-Achse als Zeitindex angezeigt..
-""")
+    **Export (JPG, Qualität 80%)**  
+    Erstellt ein JPG (80 % Qualität). Dateiname = Session-Name (z. B. `brainzz_2025-09-16--06-17-25`). Du kannst nur die Timeline oder Timeline + Balken exportieren.
+
+    **Wenn die Timeline leer ist**  
+    Stelle sicher, dass die CSV eine Zeitspalte enthält (z. B. `timestamp`, `time`, `datetime`) — sonst wird ein Zeitsprung-Fallback benutzt.
+    """)
+
 smooth = st.slider("Glättungsfenster (Sessions)", 1, 15, 2, 1)
 st.session_state["last_smooth"] = smooth
 
