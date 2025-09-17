@@ -636,29 +636,57 @@ uploads = st.file_uploader(
 
 # Demodaten-Button direkt unter Upload
 st.markdown("")  # kleiner Abstand
+# ---------------- Demodaten: Download von Dropbox (fester Link) ----------------
+# Achtung: Dropbox-Download muss 'dl=1' haben, sonst erhältst du eine HTML-Seite statt der ZIP.
+DEMO_DROPBOX_URL = "https://www.dropbox.com/scl/fi/hmqghczn82y44tgkvs1ed/Demodaten.zip?rlkey=in45kdpanz3ix6slios8fge0x&dl=1"
+
 if st.button("Demodaten laden"):
     try:
-        zip_bytes = create_test_zip_nested(num_archives=12, rows=400, fs=250, csvs_per_archive=1)
-        demo_name = f"demodaten_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-        demo_path = os.path.join(workdir, demo_name)
-        with open(demo_path, "wb") as fh:
-            fh.write(zip_bytes)
+        st.info("Demodaten werden heruntergeladen...")
 
-        # 1) äußere ZIP entpacken in eigenen Zielordner
+        # Versuch mit requests (häufig installiert). Falls nicht vorhanden, Fallback auf urllib.
+        demo_name = f"demodaten_dropbox_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        demo_path = os.path.join(workdir, demo_name)
+
+        try:
+            import requests
+            with requests.get(DEMO_DROPBOX_URL, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(demo_path, "wb") as fh:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            fh.write(chunk)
+        except Exception as e_req:
+            # Fallback: urllib
+            try:
+                from urllib.request import urlopen, Request
+                req = Request(DEMO_DROPBOX_URL, headers={"User-Agent": "python-urllib/3"})
+                with urlopen(req, timeout=60) as response, open(demo_path, "wb") as out_file:
+                    shutil.copyfileobj(response, out_file)
+            except Exception as e_url:
+                raise RuntimeError(f"Download fehlgeschlagen (requests: {e_req}; urllib: {e_url})")
+
+        # 1) äußere ZIP in eigenen Ordner entpacken
         extract_target = os.path.join(workdir, os.path.splitext(demo_name)[0] + "_extracted")
         os.makedirs(extract_target, exist_ok=True)
-        with zipfile.ZipFile(demo_path, "r") as zf:
-            zf.extractall(extract_target)
+        try:
+            with zipfile.ZipFile(demo_path, "r") as zf:
+                zf.extractall(extract_target)
+        except zipfile.BadZipFile as e:
+            # evtl. heruntergeladene Datei ist keine ZIP -> Fehler
+            raise RuntimeError(f"Heruntergeladene Datei ist kein gültiges ZIP-Archiv: {e}")
 
-        # 2) rekursiv entpacken: innere ZIPs, evtl. weitere Ebenen
-        recursively_extract_archives(extract_target)   # entpackt inner ZIPs im extract_target
-        recursively_extract_archives(workdir)         # nochmal global, falls etwas anders liegt
+        # 2) rekursiv alle inneren ZIPs entpacken (falls vorhanden)
+        #    rekursiv arbeiten sowohl im extract_target als auch global im workdir
+        recursively_extract_archives(extract_target)
+        recursively_extract_archives(workdir)
 
-        # 3) Zähle CSVs und zeige an
+        # 3) Zähle CSVs und success message
         csvs_now = [p for p in glob.glob(os.path.join(workdir, "**", "*.csv"), recursive=True)]
-        st.success(f"Demodaten erzeugt und entpackt ({len(csvs_now)} CSV(s) verfügbar).")
+        st.success(f"Demodaten heruntergeladen und entpackt ({len(csvs_now)} CSV(s) gefunden). Klicke jetzt auf 'Auswertung starten'.")
     except Exception as e:
-        st.error(f"Fehler beim Erzeugen/Entpacken der Demodaten: {e}")
+        st.error(f"Fehler beim Herunterladen/Entpacken der Demodaten: {e}")
+
 
 # Falls Dateien hochgeladen wurden, speichern wir sie ins workdir
 if uploads:
